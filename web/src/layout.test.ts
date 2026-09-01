@@ -77,6 +77,31 @@ describe("control-room layout", () => {
     expect(layout.rects.filter((r) => r.entity.type === "instance")).toHaveLength(3);
   });
 
+  it("a stopped instance is not drawn, even if another pi still lists it as a peer", () => {
+    let graph = createGraphState();
+    const started = (session: string, name: string) => ({
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "i-" + session, seq: 1, ts: 1000,
+      sessionId: session, workspaceId: "0123456789abcdef01234567", type: "instance.started",
+      payload: { displayName: name, persona: "elite", model: "p/m", status: "active", pid: 1, contextPercent: 5, exocomEnabled: true },
+    }) as unknown as TelemetryEvent;
+    graph = reduceTelemetry(graph, started("s-you", "you"));
+    graph = reduceTelemetry(graph, started("s-hermes", "hermes"));
+    graph = reduceTelemetry(graph, {
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "stop", seq: 2, ts: 2000,
+      sessionId: "s-hermes", workspaceId: "0123456789abcdef01234567", type: "instance.stopped",
+      payload: { reason: "shutdown" },
+    } as unknown as TelemetryEvent);
+    graph = reduceTelemetry(graph, {
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "p-1", seq: 2, ts: 2000,
+      sessionId: "s-you", workspaceId: "0123456789abcdef01234567", type: "peers.snapshot",
+      payload: { peers: [{ sessionId: "s-hermes", displayName: "hermes", persona: "elite", model: "p/m", contextPercent: 5, status: "online", sent: 0, received: 0 }] },
+    } as unknown as TelemetryEvent);
+
+    const layout = computeLayout(graph, 1400, 900);
+    expect(layout.rects.map((r) => r.label)).not.toContain("hermes");
+    expect(layout.rects.filter((r) => r.entity.type === "instance").map((r) => r.label)).toEqual(["you"]);
+  });
+
   it("two instances both seeing the same stranger draw it once, not twice", () => {
     let graph = createGraphState();
     const sees = (observer: string) => ({

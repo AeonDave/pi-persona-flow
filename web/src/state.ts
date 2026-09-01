@@ -159,6 +159,12 @@ export function useTimelineView(graph: GraphState, cursor: number | undefined): 
   return { events, graph: reviewed ?? graph };
 }
 
+/** A stopped or stale stream's children keep whatever status they last reported — the reducer will not
+ *  guess a terminal state it never observed — so liveness on screen has to be read from the stream. */
+export function liveStream(status: string): boolean {
+  return status !== "stopped" && status !== "stale";
+}
+
 /** A peer row is keyed `producer::observer::observed`. The observer stream is every prefix that
  *  already exists as a filtered instance key — the same walk the reducer uses when pruning. */
 function peerObservedBy(peerKey: string, sessions: Set<string>): boolean {
@@ -166,6 +172,33 @@ function peerObservedBy(peerKey: string, sessions: Set<string>): boolean {
     if (sessions.has(peerKey.slice(0, cut))) return true;
   }
   return false;
+}
+
+/** The instance card a peer/exocom endpoint key refers to. Both are `producer::observer::observed`
+ *  (or `producer::observer` for a self-reference); the pi being named is the LAST segment. */
+function instanceKeyForPeer(peerKey: string): string {
+  const producer = peerKey.slice(0, Math.max(0, peerKey.indexOf("::")));
+  const observed = peerKey.slice(peerKey.lastIndexOf("::") + 2);
+  return producer && observed ? `${producer}::${observed}` : peerKey;
+}
+
+/**
+ * LIVE canvas: a closed Pi stays in the JSONL log (REVIEW can still scrub it) but it is not
+ * presence. Without this, every prior `--exocom` session in the workspace reappears as a card.
+ */
+export function livePresence(graph: GraphState): GraphState {
+  const instanceEntries = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
+  const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
+  const agents = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
+  const agentKeys = new Set(Object.keys(agents));
+  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(`${tool.producerId}::${tool.sessionId}`) && agentKeys.has(tool.agentKey)));
+  const peers = Object.fromEntries(Object.entries(graph.peers).filter(([key]) => {
+    if (!peerObservedBy(key, sessions)) return false;
+    const known = graph.instances[instanceKeyForPeer(key)];
+    return !known || liveStream(known.status);
+  }));
+  const messages = graph.messages.filter((message) => sessions.has(`${message.producerId}::${message.sessionId}`));
+  return { ...graph, instances: Object.fromEntries(instanceEntries), agents, tools, peers, messages };
 }
 
 /** Instance/persona/channel scope for the canvas. Exocom is not a workspace-wide leak: a message

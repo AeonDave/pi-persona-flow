@@ -57,8 +57,16 @@ pi --flow
 PI_PERSONA_FLOW_AUTOSTART=1 pi
 ```
 
+On start, Pi shows a persistent line you can click:
+
+```text
+flow dashboard at http://127.0.0.1:7874/?token=…
+```
+
+The footer also names `127.0.0.1:<port>`. Do not type the port by itself — without the token the page loads and then sits empty on a 401. `/dashboard status` reprints the same link; `/dashboard` opens it in the browser.
+
 Default port is `7874` (`PI_PERSONA_FLOW_PORT` to override). If that port is taken, the extension
-binds an OS-assigned loopback port instead.
+binds an OS-assigned loopback port instead — which is why the announced URL matters.
 
 Run the dashboard in **one** session. It tails every producer's log for that workspace; the other
 sessions need nothing extra. All sessions must share the same working directory — the workspace id
@@ -129,5 +137,5 @@ Key files:
 - tails only appended file bytes and bounds unterminated lines;
 - deduplicates live-bus and JSONL copies by producer/session/event identity;
 - caps retained events, messages, and completed stream projections;
-- marks instances stale when heartbeats stop;
+- marks instances stale when heartbeats stop; LIVE topology hides stopped/stale Pi so a closed `--exocom` session does not linger as a card (REVIEW still scrubs the log);
 - Windows `/dashboard` opens via `rundll32` (never `cmd /c start`).

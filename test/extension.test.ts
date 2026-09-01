@@ -152,7 +152,61 @@ test("the status line never advertises a URL that cannot authenticate", async ()
   const shown = uiUpdates.join(" | ");
   const bare = /https?:\/\/127\.0\.0\.1:\d+(?![^\s|]*token)/;
   assert.ok(!bare.test(shown), `the status line offers a tokenless URL that 401s: ${shown}`);
-  assert.match(shown, /\/dashboard/, "the status line must name the command that actually opens it");
+  assert.match(shown, /127\.0\.0\.1:\d+/, "the footer must name the host:port the server is on");
+  const shutdown = m.handlers.get("session_shutdown")![0] as () => Promise<void>;
+  await shutdown();
+});
+
+test("--flow announces a tokenized dashboard URL you can actually open", async () => {
+  // Autostart used to toast a URL that vanished, then leave the footer as
+  // `:7874 · /dashboard` — so `--flow` looked like it did nothing. The listening
+  // address has to stay on a widget (not a toast of the same line stacked above exocom).
+  const m = mockPi();
+  m.api.getFlag = (name: string): unknown => (name === "flow" ? true : undefined);
+  // @ts-expect-error — minimal mock.
+  piPersonaFlow(m.api);
+  const cwd = mkdtempSync(join(tmpdir(), "flow-announce-"));
+  const notices: string[] = [];
+  const widgets: Array<string[] | undefined> = [];
+  const context = {
+    cwd,
+    hasUI: true,
+    ui: {
+      setStatus: () => undefined,
+      notify: (value: string) => notices.push(value),
+      setWidget: (_key: string, content: string[] | undefined) => { widgets.push(content); },
+    },
+  };
+  const start = m.handlers.get("session_start")![0] as (event: unknown, ctx: typeof context) => Promise<void>;
+  await start({}, context);
+
+  const announced = widgets.flatMap((lines) => lines ?? []).join("\n");
+  assert.match(announced, /flow dashboard at http:\/\/127\.0\.0\.1:\d+\/\?token=/);
+  assert.ok(widgets.some((lines) => lines?.some((line) => line.includes("?token="))), "the URL must stay on a widget, not only a vanishing toast");
+  assert.equal(notices.filter((n) => n.includes("flow dashboard at")).length, 0, "do not toast the same URL the widget already shows");
+  const shutdown = m.handlers.get("session_shutdown")![0] as () => Promise<void>;
+  await shutdown();
+});
+
+test("headless --flow still prints the listening URL", async () => {
+  const m = mockPi();
+  m.api.getFlag = (name: string): unknown => (name === "flow" ? true : undefined);
+  // @ts-expect-error — minimal mock.
+  piPersonaFlow(m.api);
+  const cwd = mkdtempSync(join(tmpdir(), "flow-headless-"));
+  const written: string[] = [];
+  const original = process.stdout.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    written.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    const start = m.handlers.get("session_start")![0] as (event: unknown, ctx: { cwd: string; hasUI: boolean }) => Promise<void>;
+    await start({}, { cwd, hasUI: false });
+  } finally {
+    process.stdout.write = original;
+  }
+  assert.match(written.join(""), /flow dashboard at http:\/\/127\.0\.0\.1:\d+\/\?token=/);
   const shutdown = m.handlers.get("session_shutdown")![0] as () => Promise<void>;
   await shutdown();
 });

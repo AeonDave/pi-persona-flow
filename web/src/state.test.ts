@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry, type GraphState } from "../../src/reducer";
-import { filterGraph, useTimelineView, type Filters, type TimelineView } from "./state";
+import { filterGraph, livePresence, useTimelineView, type Filters, type TimelineView } from "./state";
 
 /** The fold is the cost this view is measured by, so the test counts it rather than timing it. */
 vi.mock("../../src/reducer", async (importOriginal) => {
@@ -193,5 +193,24 @@ describe("instance filter", () => {
   it("does not let the other instance's exocom through just because the channel is exocom", () => {
     const scoped = filterGraph(workspaceGraph(), { ...ALL, instance: "pi-persona::alpha", channel: "exocom" });
     expect(scoped.messages.map((message) => message.id)).toEqual(["exo-a"]);
+  });
+});
+
+describe("live presence", () => {
+  it("drops a closed Pi so a leftover --exocom session is not live topology", () => {
+    let graph = workspaceGraph();
+    graph = reduceTelemetry(graph, v2("beta", 10, "instance.stopped", { reason: "shutdown" }));
+    const live = livePresence(graph);
+    expect(Object.keys(live.instances)).toEqual(["pi-persona::alpha"]);
+    expect(Object.keys(live.peers)).toEqual([]);
+    expect(live.messages.map((message) => message.id).sort()).toEqual(["exo-a", "ic-a"]);
+  });
+
+  it("does not resurrect a stopped peer from a live observer's last snapshot", () => {
+    let graph = workspaceGraph();
+    graph = reduceTelemetry(graph, v2("beta", 10, "instance.stopped", { reason: "shutdown" }));
+    // Alpha still names beta — that snapshot is history, not presence.
+    expect(Object.keys(graph.peers)).toContain("pi-persona::alpha::beta");
+    expect(Object.keys(livePresence(graph).peers)).not.toContain("pi-persona::alpha::beta");
   });
 });

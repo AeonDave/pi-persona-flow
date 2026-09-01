@@ -59,18 +59,53 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     if (current) await current.close();
   }
 
+  type SessionUi = {
+    hasUI: boolean;
+    ui: {
+      notify(message: string, type?: "info" | "warning" | "error"): void;
+      setStatus(key: string, text: string | undefined): void;
+      setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
+    };
+  };
+  let sessionUi: SessionUi | undefined;
+
+  function listeningHostPort(): string | undefined {
+    if (!server) return undefined;
+    try {
+      const parsed = new URL(server.url);
+      return `${parsed.hostname}:${parsed.port || String(server.port)}`;
+    } catch {
+      return `127.0.0.1:${server.port}`;
+    }
+  }
+
   function statusText(): string {
     // Runs on every ingested event, so it reads the graph in place instead of deep-copying it.
     const state = store?.peek();
     if (!state) return "flow stopped";
     const agents = Object.keys(state.agents).length;
     const peers = Object.keys(state.peers).length;
-    // Deliberately NOT the bare origin: the dashboard is token-gated, so `http://127.0.0.1:<port>`
-    // loads the page and then sits empty on a 401 from /api/snapshot. The full URL carries a secret
-    // and is too long for a status line, so name the command that opens it — `/dashboard status` prints
-    // the tokenized link when the browser needs to be pointed by hand.
-    const dashboard = server ? `:${server.port} · /dashboard` : "stopped";
+    // Host:port in the footer so `--flow` is not a mystery. Never a tokenless `http://…` —
+    // that 401s. The clickable tokenized URL lives on the widget / notify / stdout line.
+    const dashboard = listeningHostPort() ?? "stopped";
     return `flow ${dashboard} · ${agents} agents · ${peers} peers`;
+  }
+
+  function announceListening(url: string): void {
+    const line = dashboardListeningLine(url);
+    if (!sessionUi?.hasUI) {
+      process.stdout.write(`${line}\n`);
+      return;
+    }
+    try { sessionUi.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable */ }
+    // Widget only — a toast of the same line stacks above the exocom row and duplicates it.
+    try { sessionUi.ui.setWidget?.("flow", [line], { placement: "aboveEditor" }); } catch { /* older Pi / RPC */ }
+  }
+
+  function hideListening(): void {
+    if (!sessionUi?.hasUI) return;
+    try { sessionUi.ui.setWidget?.("flow", undefined); } catch { /* older Pi / RPC */ }
+    try { sessionUi.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable */ }
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -78,6 +113,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     const startupGeneration = generation;
     const previousServer = server;
     server = undefined;
+    sessionUi = ctx;
     unsubscribeTelemetry?.();
     unsubscribeTelemetry = undefined;
     unsubscribeStatus?.();
@@ -114,9 +150,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     }
     if (autostart()) {
       const started = await startIfNeeded();
-      if (started && generation === currentGeneration && ctx.hasUI) {
-        ctx.ui.notify(`pi-persona-flow: dashboard at ${started.url}`, "info");
-      }
+      if (started && generation === currentGeneration) announceListening(started.url);
     }
   });
 
@@ -138,7 +172,9 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     tailer?.stop();
     tailer = undefined;
     await stopServer();
+    hideListening();
     store = undefined;
+    sessionUi = undefined;
   });
 
   // NOT "flow": pi-persona already owns /flow for running a flow (a DAG over strategies). It wins the
@@ -151,13 +187,14 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
       const sub = (args ?? "").trim().toLowerCase();
       if (sub === "stop") {
         await stopServer();
+        hideListening();
         if (ctx.hasUI) ctx.ui.notify("pi-persona-flow: dashboard stopped.", "info");
         return;
       }
       if (sub === "status") {
-        const text = `${server?.url ?? "stopped"} — ${statusText().replace(/^flow /, "")}`;
-        if (ctx.hasUI) ctx.ui.notify(`pi-persona-flow: ${text}`, "info");
-        else process.stdout.write(`pi-persona-flow: ${text}\n`);
+        const text = server ? dashboardListeningLine(server.url) : "flow dashboard stopped";
+        if (ctx.hasUI) ctx.ui.notify(text, "info");
+        else process.stdout.write(`${text}\n`);
         return;
       }
       const started = await startIfNeeded();
@@ -166,7 +203,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
         return;
       }
       if (sub === "" || sub === "open" || sub === "serve") openBrowser(started.url);
-      if (ctx.hasUI) ctx.ui.notify(`pi-persona-flow: dashboard at ${started.url}`, "info");
+      announceListening(started.url);
     },
   });
 
@@ -175,6 +212,11 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     default: false,
     description: "Auto-start the pi-persona-flow dashboard on session start",
   });
+}
+
+/** The line `--flow` and `/dashboard` put on screen: host, port, and the token that actually opens it. */
+export function dashboardListeningLine(url: string): string {
+  return `flow dashboard at ${url}`;
 }
 
 /** Never `cmd /c start`: cmd.exe re-parses `&` `|` `^` in the URL before `start` runs.
