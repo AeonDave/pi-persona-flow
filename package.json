@@ -1,0 +1,65 @@
+{
+  "name": "pi-persona-flow",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Local real-time dashboard for generic Pi plugin lifecycle telemetry, with rich pi-persona orchestration views.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "persona",
+    "subagents",
+    "orchestration",
+    "telemetry",
+    "observability",
+    "exocom",
+    "intercom",
+    "visualization",
+    "dashboard"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "AeonDave"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AeonDave/pi-persona-flow.git"
+  },
+  "files": [
+    "src",
+    "shared",
+    "dist/web",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "web:test": "npm --prefix web test",
+    "web:typecheck": "npm --prefix web run typecheck",
+    "web:build": "npm --prefix web run build",
+    "build": "npm run typecheck && npm run web:build",
+    "test:all": "npm test && npm run web:test",
+    "typecheck:all": "npm run typecheck && npm run web:typecheck"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  }
+}

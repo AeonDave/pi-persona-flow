@@ -1,0 +1,22 @@
+node_modules/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
+.pi/
+.superpowers/
+.playwright-cli/
+
+# Local clones of other UIs — never part of this package
+examples/
+
+# Playwright / fixture dumps. Keep the fixture runner itself.
+test-results/*
+!test-results/serve-fixture.mts
+
+# Vite leftovers, but ship dist/web so `pi install git:...` has the dashboard.
+/dist/*
+!/dist/web/
+!/dist/web/**
