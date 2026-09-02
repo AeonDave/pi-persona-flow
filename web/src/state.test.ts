@@ -213,4 +213,38 @@ describe("live presence", () => {
     expect(Object.keys(graph.peers)).toContain("pi-persona::alpha::beta");
     expect(Object.keys(livePresence(graph).peers)).not.toContain("pi-persona::alpha::beta");
   });
+
+  it("keeps tools that belong to a live instance even when they have no agent card", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
+      displayName: "you", persona: "elite", model: "m", status: "active", pid: 1, contextPercent: 1, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 2, "tool.started", {
+      callId: "tc-1", agentId: "you", name: "read", status: "running",
+    }));
+    expect(Object.keys(livePresence(graph).tools)).toHaveLength(1);
+  });
+
+  it("drops concluded subagents and their tools from LIVE, but keeps a failed agent", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "m", status: "idle", pid: 1, contextPercent: 36, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 2, "agent.added", {
+      id: "done-run", label: "done-run", kind: "subagent", status: "done",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 3, "agent.added", {
+      id: "fail-run", label: "fail-run", kind: "subagent", status: "failed",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 4, "tool.started", {
+      callId: "tc-done", agentId: "done-run", name: "read", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 5, "tool.finished", {
+      callId: "tc-done", agentId: "done-run", name: "read", status: "done", durationMs: 10,
+    }));
+    const live = livePresence(graph);
+    expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::fail-run"]);
+    expect(Object.keys(live.tools)).toEqual([]);
+    expect(Object.keys(graph.agents)).toHaveLength(2);
+  });
 });

@@ -165,6 +165,12 @@ export function liveStream(status: string): boolean {
   return status !== "stopped" && status !== "stale";
 }
 
+/** Concluded subagents stay in the JSONL (REVIEW still has them). LIVE is presence: done/stopped
+ *  work is history. Failed stays — that is the error the operator still needs to see. */
+export function liveAgent(status: string): boolean {
+  return status !== "done" && status !== "stopped";
+}
+
 /** A peer row is keyed `producer::observer::observed`. The observer stream is every prefix that
  *  already exists as a filtered instance key — the same walk the reducer uses when pruning. */
 function peerObservedBy(peerKey: string, sessions: Set<string>): boolean {
@@ -189,9 +195,15 @@ function instanceKeyForPeer(peerKey: string): string {
 export function livePresence(graph: GraphState): GraphState {
   const instanceEntries = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
-  const agents = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
-  const agentKeys = new Set(Object.keys(agents));
-  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(`${tool.producerId}::${tool.sessionId}`) && agentKeys.has(tool.agentKey)));
+  const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
+  const agents = Object.fromEntries(Object.entries(roster).filter(([, agent]) => liveAgent(agent.status)));
+  const liveAgentKeys = new Set(Object.keys(agents));
+  const rosterKeys = new Set(Object.keys(roster));
+  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => {
+    if (!sessions.has(`${tool.producerId}::${tool.sessionId}`)) return false;
+    if (liveAgentKeys.has(tool.agentKey)) return true;
+    return !rosterKeys.has(tool.agentKey);
+  }));
   const peers = Object.fromEntries(Object.entries(graph.peers).filter(([key]) => {
     if (!peerObservedBy(key, sessions)) return false;
     const known = graph.instances[instanceKeyForPeer(key)];
@@ -208,8 +220,7 @@ export function filterGraph(graph: GraphState, filters: Filters): GraphState {
     (!filters.instance || sessionId === filters.instance) && (!filters.persona || instance.persona === filters.persona));
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
   const agents = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
-  const agentKeys = new Set(Object.keys(agents));
-  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(`${tool.producerId}::${tool.sessionId}`) && agentKeys.has(tool.agentKey)));
+  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(`${tool.producerId}::${tool.sessionId}`)));
   const peers = Object.fromEntries(Object.entries(graph.peers).filter(([key]) => peerObservedBy(key, sessions)));
   const messages = graph.messages.filter((message) => {
     if (filters.channel !== "all" && message.channel !== filters.channel) return false;

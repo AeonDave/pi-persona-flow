@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry } from "../../src/reducer";
-import { computeLayout, distinctPeers, inFlightTraffic, messagesForSelection, modelLabel } from "./App";
+import { agentTitle, computeLayout, distinctPeers, formatElapsed, inFlightTraffic, messagesForSelection, modelLabel, rankCanvasTools, toolOwnerKey, toolsForSelection } from "./App";
+import { livePresence } from "./state";
 
 const instance = (seq: number, type: "instance.started" | "agent.added", payload: TelemetryEvent["payload"]): TelemetryEvent => ({
   version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: `test-${seq}`, seq, ts: seq * 1000, sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type, payload,
@@ -123,6 +124,11 @@ describe("control-room layout", () => {
     expect(modelLabel("claude-pro-max-native/claude-opus-4-6")).toBe("claude-opus-4-6");
     expect(modelLabel("test-model")).toBe("test-model");
     expect(modelLabel(undefined)).toBe("");
+    expect(agentTitle("duskull-spectre-digest · glm-5.3", "openrouter/z-ai/glm-5.3")).toBe("duskull-spectre-digest");
+    expect(agentTitle("Scout", "provider/model")).toBe("Scout");
+    expect(formatElapsed(8_000)).toBe("8s");
+    expect(formatElapsed(8 * 60_000)).toBe("8m");
+    expect(formatElapsed(3 * 3_600_000 + 26 * 60_000)).toBe("3h 26m");
   });
 
   it("an exocom edge between two known instances links their cards, not vanished peer nodes", () => {
@@ -221,5 +227,97 @@ describe("control-room layout", () => {
     const traffic = messagesForSelection(graph.messages, { type: "instance", key: "pi-persona::alpha" });
     expect(traffic.map((message) => message.id)).toEqual(["ask-1"]);
     expect(graph.messages[0]?.fromKey).toBe("pi-persona::alpha::supervisor");
+  });
+
+  const toolCall = (seq: number, callId: string, agentId: string, name: string, status: "running" | "done" | "failed", durationMs?: number): TelemetryEvent => ({
+    version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: `tool-${seq}`, seq, ts: seq * 1000,
+    sessionId: "alpha", workspaceId: "0123456789abcdef01234567",
+    type: status === "running" ? "tool.started" : "tool.finished",
+    payload: status === "running"
+      ? { callId, agentId, name, status }
+      : { callId, agentId, name, status, durationMs: durationMs ?? 10 },
+  } as unknown as TelemetryEvent);
+
+  it("canvas chips are live and failed calls only, capped at three", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "you", persona: "elite", model: "kimi-k3", status: "active", pid: 1, contextPercent: 6, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", {
+      id: "ember", label: "ember-rust-patterns · kimi-k3", kind: "subagent", status: "running", agent: "operator", model: "openrouter/kimi-k3",
+    }));
+    for (let index = 0; index < 12; index += 1) {
+      graph = reduceTelemetry(graph, toolCall(10 + index * 2, `tc-${index}`, "ember", "read", "running"));
+      graph = reduceTelemetry(graph, toolCall(11 + index * 2, `tc-${index}`, "ember", "read", "done", 20 + index));
+    }
+    for (let index = 0; index < 4; index += 1) {
+      graph = reduceTelemetry(graph, toolCall(50 + index * 2, `fail-${index}`, "ember", "bash", "running"));
+      graph = reduceTelemetry(graph, toolCall(51 + index * 2, `fail-${index}`, "ember", "bash", "failed", 4));
+    }
+    graph = reduceTelemetry(graph, toolCall(80, "tc-live", "ember", "grep", "running"));
+
+    const layout = computeLayout(graph, 900, 600);
+    const agent = layout.rects.find((rect) => rect.entity.type === "agent");
+    const chips = layout.rects.filter((rect) => rect.entity.type === "tool");
+    expect(agent?.label).toBe("ember-rust-patterns");
+    expect(agent?.detail).toContain("kimi-k3");
+    expect(agent?.detail).toContain("4 failed");
+    expect(chips).toHaveLength(3);
+    expect(new Set(chips.map((rect) => rect.y)).size).toBe(1);
+    expect(chips.every((rect) => (
+      rect.x >= agent!.x && rect.y >= agent!.y
+      && rect.x + rect.width <= agent!.x + agent!.width + 0.5
+      && rect.y + rect.height <= agent!.y + agent!.height + 0.5
+    ))).toBe(true);
+    expect(chips.some((rect) => rect.label === "grep" && rect.status === "running")).toBe(true);
+    expect(chips.filter((rect) => rect.status === "failed")).toHaveLength(2);
+    expect(agent?.meta).toBe("+2");
+    expect(rankCanvasTools(Object.values(graph.tools)).visible[0]?.name).toBe("grep");
+  });
+
+  it("pins tools with no agent card onto the instance — that is the main Pi", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "you", persona: "elite", model: "kimi-k3", status: "active", pid: 1, contextPercent: 6, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, toolCall(2, "tc-main", "you", "read", "running"));
+    const layout = computeLayout(graph, 900, 600);
+    const root = layout.rects.find((rect) => rect.entity.type === "instance");
+    const chips = layout.rects.filter((rect) => rect.entity.type === "tool");
+    expect(layout.rects.some((rect) => rect.entity.type === "agent")).toBe(false);
+    expect(chips).toHaveLength(1);
+    expect(chips[0]?.label).toBe("read");
+    expect(root && chips[0] && chips[0].y >= root.y && chips[0].y + chips[0].height <= root.y + root.height).toBe(true);
+    expect(root?.detail).toContain("kimi-k3");
+    expect(root?.contextPercent).toBe(6);
+    expect(toolOwnerKey(Object.values(graph.tools)[0]!, new Set())).toBe("pi-persona::alpha");
+    expect(toolsForSelection(graph, { type: "instance", key: "pi-persona::alpha" }).map((tool) => tool.callId)).toEqual(["tc-main"]);
+  });
+
+  it("LIVE presence hides concluded subagents; REVIEW layout still has them", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "openrouter/z-ai/glm-5.3", status: "idle", pid: 1, contextPercent: 36, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", {
+      id: "done-run", label: "duskull-spectre-digest · glm-5.3", kind: "subagent", status: "done", agent: "operator", model: "openrouter/z-ai/glm-5.3",
+    }));
+    graph = reduceTelemetry(graph, instance(3, "agent.added", {
+      id: "live-run", label: "shuppet-wraith-digest · glm-5.3", kind: "subagent", status: "running", agent: "operator", model: "openrouter/z-ai/glm-5.3",
+    }));
+    graph = reduceTelemetry(graph, toolCall(4, "old-read", "done-run", "read", "running"));
+    graph = reduceTelemetry(graph, toolCall(5, "old-read", "done-run", "read", "done", 20));
+
+    const live = livePresence(graph);
+    expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::live-run"]);
+    expect(Object.keys(live.tools)).toEqual([]);
+    expect(computeLayout(live, 900, 600).rects.filter((rect) => rect.entity.type === "agent").map((rect) => rect.label)).toEqual(["shuppet-wraith-digest"]);
+
+    const reviewed = computeLayout(graph, 900, 600);
+    expect(reviewed.rects.filter((rect) => rect.entity.type === "agent")).toHaveLength(2);
+    const done = reviewed.rects.find((rect) => rect.label === "duskull-spectre-digest");
+    expect(done?.status).toBe("done");
+    expect(done?.detail).toContain("glm-5.3");
+    expect(done?.span).toBeDefined();
   });
 });
