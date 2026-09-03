@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry } from "../../src/reducer";
-import { agentTitle, computeLayout, distinctPeers, formatElapsed, inFlightTraffic, messagesForSelection, modelLabel, rankCanvasTools, toolOwnerKey, toolsForSelection } from "./App";
+import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messagesForSelection, modelLabel, rankCanvasTools, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
 import { livePresence } from "./state";
 
 const instance = (seq: number, type: "instance.started" | "agent.added", payload: TelemetryEvent["payload"]): TelemetryEvent => ({
@@ -319,5 +319,62 @@ describe("control-room layout", () => {
     expect(done?.status).toBe("done");
     expect(done?.detail).toContain("glm-5.3");
     expect(done?.span).toBeDefined();
+  });
+
+  it("LIVE drops a concluded failed run; a failed stamp with live tools still shows as running", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "openrouter/z-ai/glm-5.3", status: "active", pid: 1, contextPercent: 40, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", {
+      id: "dead-run", label: "phantump-transport-loop · glm-5.3", kind: "subagent", status: "failed", agent: "operator", model: "openrouter/z-ai/glm-5.3",
+    }));
+    graph = reduceTelemetry(graph, instance(3, "agent.added", {
+      id: "hurt-run", label: "larvitar-platform-finish · glm-5.2", kind: "subagent", status: "failed", agent: "operator", model: "openrouter/z-ai/glm-5.2",
+    }));
+    graph = reduceTelemetry(graph, toolCall(4, "live-read", "hurt-run", "read", "running"));
+    graph = reduceTelemetry(graph, toolCall(5, "old-bash", "hurt-run", "bash", "running"));
+    graph = reduceTelemetry(graph, toolCall(6, "old-bash", "hurt-run", "bash", "failed", 4));
+
+    expect(displayAgentStatus("failed", { running: 1 })).toBe("running");
+    expect(displayAgentStatus("failed", { running: 0 })).toBe("failed");
+
+    const live = computeLayout(livePresence(graph), 721, 571);
+    expect(live.rects.filter((rect) => rect.entity.type === "agent").map((rect) => `${rect.label}:${rect.status}`)).toEqual(["larvitar-platform-finish:running"]);
+    expect(live.rects.find((rect) => rect.label === "larvitar-platform-finish")?.detail).toContain("1 failed");
+    expect(live.rects.find((rect) => rect.label === "larvitar-platform-finish")?.detail).toContain("1 live");
+  });
+
+  it("sibling cards wrap instead of overlapping when the canvas is the live inspector width", () => {
+    expect(siblingColumns(4, 400)).toEqual({ cols: 2, itemWidth: 176 });
+    expect(siblingColumns(4, 621).cols).toBe(4);
+
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "glm-5.3", status: "active", pid: 1, contextPercent: 40, exocomEnabled: true,
+    }));
+    for (let index = 0; index < 7; index += 1) {
+      graph = reduceTelemetry(graph, instance(2 + index, "agent.added", {
+        id: `run-${index}`, label: `agent-${index}`, kind: "subagent", status: "running",
+      }));
+    }
+    const layout = computeLayout(graph, 721, 571);
+    const agents = layout.rects.filter((rect) => rect.entity.type === "agent");
+    expect(agents).toHaveLength(7);
+    expect(new Set(agents.map((rect) => rect.y)).size).toBeGreaterThan(1);
+    for (let i = 0; i < agents.length; i += 1) {
+      for (let j = i + 1; j < agents.length; j += 1) {
+        const a = agents[i]!;
+        const b = agents[j]!;
+        const overlap = a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+        expect(overlap, `${a.label} overlaps ${b.label}`).toBe(false);
+      }
+    }
+    const chips = layout.rects.filter((rect) => rect.entity.type === "tool");
+    expect(chips.every((chip) => agents.some((agent) => (
+      chip.x >= agent.x && chip.y >= agent.y
+      && chip.x + chip.width <= agent.x + agent.width + 0.5
+      && chip.y + chip.height <= agent.y + agent.height + 0.5
+    )))).toBe(true);
   });
 });

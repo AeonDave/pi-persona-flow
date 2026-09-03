@@ -165,10 +165,15 @@ export function liveStream(status: string): boolean {
   return status !== "stopped" && status !== "stale";
 }
 
-/** Concluded subagents stay in the JSONL (REVIEW still has them). LIVE is presence: done/stopped
- *  work is history. Failed stays — that is the error the operator still needs to see. */
+/** Concluded subagents stay in the JSONL (REVIEW still has them). LIVE is presence: done/stopped/
+ *  failed runs are history. A failed stamp is not a reason to keep a finished card on the canvas —
+ *  the operator still sees those errors on the tools of any run that is actually still going. */
 export function liveAgent(status: string): boolean {
-  return status !== "done" && status !== "stopped";
+  return status !== "done" && status !== "stopped" && status !== "failed";
+}
+
+function liveToolWork(status: string): boolean {
+  return status !== "done" && status !== "failed";
 }
 
 /** A peer row is keyed `producer::observer::observed`. The observer stream is every prefix that
@@ -196,7 +201,11 @@ export function livePresence(graph: GraphState): GraphState {
   const instanceEntries = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
   const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
-  const agents = Object.fromEntries(Object.entries(roster).filter(([, agent]) => liveAgent(agent.status)));
+  const liveToolOwners = new Set<string>();
+  for (const tool of Object.values(graph.tools)) {
+    if (sessions.has(`${tool.producerId}::${tool.sessionId}`) && liveToolWork(tool.status)) liveToolOwners.add(tool.agentKey);
+  }
+  const agents = Object.fromEntries(Object.entries(roster).filter(([, agent]) => liveAgent(agent.status) || liveToolOwners.has(agent.key)));
   const liveAgentKeys = new Set(Object.keys(agents));
   const rosterKeys = new Set(Object.keys(roster));
   const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => {

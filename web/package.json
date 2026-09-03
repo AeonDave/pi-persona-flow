@@ -10,9 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@types/d3-force": "^3.0.10",
     "@vitejs/plugin-react": "^4.4.1",
-    "d3-force": "^3.0.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

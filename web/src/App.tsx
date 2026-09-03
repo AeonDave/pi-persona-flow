@@ -1,5 +1,4 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { forceCollide, forceSimulation, forceX } from "d3-force";
 import type { MouseEvent, ReactElement } from "react";
 import {
   Activity, AlertTriangle, Bot, ChevronRight, CircleDot, Clock3, Command, Layers3, Pause, Play,
@@ -107,9 +106,29 @@ function summaryLine(model: string | undefined, stats: { total: number; failed: 
   const named = modelLabel(model);
   if (named) parts.push(named);
   if (stats.failed) parts.push(`${stats.failed} failed`);
-  else if (stats.running) parts.push(`${stats.running} live`);
-  else if (stats.total) parts.push(`${stats.total} tools`);
+  if (stats.running) parts.push(`${stats.running} live`);
+  else if (!stats.failed && stats.total) parts.push(`${stats.total} tools`);
   return parts.join(" · ");
+}
+
+/** Producer status is the last stamp, not presence. Live tools mean the run is still going. */
+export function displayAgentStatus(status: string, stats: { running: number }): string {
+  if (stats.running > 0 && ["failed", "done", "stopped"].includes(status)) return "running";
+  return status;
+}
+
+const SIBLING_GAP = 10;
+const SIBLING_MIN = 128;
+const SIBLING_MAX = 176;
+
+/** Pack siblings into as many columns as `available` can hold without overlap. Shrink below the
+ *  preferred min only when a single column would still overflow. */
+export function siblingColumns(count: number, available: number): { cols: number; itemWidth: number } {
+  const usable = Math.max(1, available);
+  if (count <= 0) return { cols: 1, itemWidth: Math.min(SIBLING_MAX, usable) };
+  const cols = Math.min(count, Math.max(1, Math.floor((usable + SIBLING_GAP) / (SIBLING_MIN + SIBLING_GAP))));
+  const itemWidth = Math.min(SIBLING_MAX, Math.max(1, (usable - (cols - 1) * SIBLING_GAP) / cols));
+  return { cols, itemWidth };
 }
 
 export function toolsForSelection(graph: GraphState, selected: EntityId): ToolView[] {
@@ -189,13 +208,6 @@ function rounded(ctx: CanvasRenderingContext2D, x: number, y: number, width: num
 }
 function center(rect: Rect): Point { return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }; }
 
-/** A small deterministic relaxation keeps siblings legible without letting them drift between frames. */
-function relaxedSiblingXs(count: number, startX: number, itemWidth: number, targetX: number): number[] {
-  const nodes = Array.from({ length: count }, (_, index) => ({ x: startX + itemWidth / 2 + index * (itemWidth + 10), y: 0 }));
-  const simulation = forceSimulation(nodes).randomSource(() => 0.5).force("x", forceX(targetX).strength(0.08)).force("collide", forceCollide(itemWidth / 2 + 5)).stop();
-  for (let tick = 0; tick < 16; tick += 1) simulation.tick();
-  return nodes.map((node) => Math.max(startX, Math.min(startX + count * itemWidth + (count - 1) * 10 - itemWidth, node.x - itemWidth / 2)));
-}
 
 /** How many PEERS there are, not how many observations were reported. Each instance names every other
  *  in its own peers.snapshot, so a workspace of N mutually-visible pi produces N*(N-1) entries — a
@@ -246,30 +258,44 @@ export function computeLayout(graph: GraphState, width: number, height: number):
     agents.sort((a, b) => a.startedAt - b.startedAt || a.key.localeCompare(b.key)).forEach((agent) => {
       const bucket = children.get(agent.parentKey) ?? []; bucket.push(agent); children.set(agent.parentKey, bucket);
     });
-    const drawChildren = (parentKey: string | undefined, parentRect: Rect): void => {
+    const drawChildren = (parentKey: string | undefined, parentRect: Rect): number => {
       const childList = children.get(parentKey) ?? [];
+      if (childList.length === 0) return parentRect.y + parentRect.height;
       const available = cardWidth - 52;
-      const itemWidth = Math.min(176, Math.max(128, (available - (childList.length - 1) * 10) / Math.max(1, childList.length)));
-      const startX = cardX + (cardWidth - (itemWidth * childList.length + Math.max(0, childList.length - 1) * 10)) / 2;
-      const siblingXs = relaxedSiblingXs(childList.length, startX, itemWidth, cardX + cardWidth / 2);
-      const y = parentRect.y + parentRect.height + 25;
-      childList.forEach((agent, childIndex) => {
-        const ownedTools = toolsByOwner.get(agent.key) ?? [];
-        const chips = rankCanvasTools(ownedTools);
-        const stats = toolStats(ownedTools);
-        const rect: Rect = {
-          x: siblingXs[childIndex] ?? startX, y, width: itemWidth,
-          height: AGENT_BODY + (chips.visible.length > 0 ? CHIP_STRIP : 0),
-          entity: { type: "agent", key: agent.key }, color: statusColor(agent.status),
-          label: agentTitle(agent.label, agent.model), status: agent.status,
-          span: formatElapsed((agent.endedAt ?? agent.updatedAt) - agent.startedAt),
-          detail: summaryLine(agent.model, stats),
-        };
-        rects.push(rect);
-        placeToolChips(rect, ownedTools, rects);
-        links.push({ from: { x: parentRect.x + parentRect.width / 2, y: parentRect.y + parentRect.height }, to: { x: rect.x + rect.width / 2, y: rect.y }, channel: "hierarchy", active: agent.status === "running" && liveStream(instance.status) });
-        drawChildren(agent.key, rect);
-      });
+      const { cols, itemWidth } = siblingColumns(childList.length, available);
+      let y = parentRect.y + parentRect.height + 25;
+      let bottom = parentRect.y + parentRect.height;
+      for (let offset = 0; offset < childList.length; ) {
+        const inRow = Math.min(cols, childList.length - offset);
+        const rowWidth = inRow * itemWidth + Math.max(0, inRow - 1) * SIBLING_GAP;
+        const startX = cardX + (cardWidth - rowWidth) / 2;
+        const row: Array<{ agent: AgentView; rect: Rect }> = [];
+        for (let index = 0; index < inRow; index += 1) {
+          const agent = childList[offset + index]!;
+          const ownedTools = toolsByOwner.get(agent.key) ?? [];
+          const chips = rankCanvasTools(ownedTools);
+          const stats = toolStats(ownedTools);
+          const shown = displayAgentStatus(agent.status, stats);
+          const rect: Rect = {
+            x: startX + index * (itemWidth + SIBLING_GAP), y, width: itemWidth,
+            height: AGENT_BODY + (chips.visible.length > 0 ? CHIP_STRIP : 0),
+            entity: { type: "agent", key: agent.key }, color: statusColor(shown),
+            label: agentTitle(agent.label, agent.model), status: shown,
+            span: formatElapsed((agent.endedAt ?? agent.updatedAt) - agent.startedAt),
+            detail: summaryLine(agent.model, stats),
+          };
+          rects.push(rect);
+          placeToolChips(rect, ownedTools, rects);
+          links.push({ from: { x: parentRect.x + parentRect.width / 2, y: parentRect.y + parentRect.height }, to: { x: rect.x + rect.width / 2, y: rect.y }, channel: "hierarchy", active: shown === "running" && liveStream(instance.status) });
+          row.push({ agent, rect });
+        }
+        let rowBottom = y;
+        for (const { agent, rect } of row) rowBottom = Math.max(rowBottom, drawChildren(agent.key, rect));
+        bottom = rowBottom;
+        offset += inRow;
+        if (offset < childList.length) y = rowBottom + 25;
+      }
+      return bottom;
     };
     drawChildren(undefined, root);
   });

@@ -225,7 +225,7 @@ describe("live presence", () => {
     expect(Object.keys(livePresence(graph).tools)).toHaveLength(1);
   });
 
-  it("drops concluded subagents and their tools from LIVE, but keeps a failed agent", () => {
+  it("drops concluded subagents from LIVE, including a failed run with no live work", () => {
     let graph = createGraphState();
     graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
       displayName: "dev", persona: "dev", model: "m", status: "idle", pid: 1, contextPercent: 36, exocomEnabled: true,
@@ -243,8 +243,33 @@ describe("live presence", () => {
       callId: "tc-done", agentId: "done-run", name: "read", status: "done", durationMs: 10,
     }));
     const live = livePresence(graph);
-    expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::fail-run"]);
+    expect(Object.keys(live.agents)).toEqual([]);
     expect(Object.keys(live.tools)).toEqual([]);
     expect(Object.keys(graph.agents)).toHaveLength(2);
+  });
+
+  it("keeps a failed stamp on LIVE when that agent still has a running tool", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "m", status: "active", pid: 1, contextPercent: 10, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 2, "agent.added", {
+      id: "fail-run", label: "fail-run", kind: "subagent", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 3, "tool.started", {
+      callId: "tc-bad", agentId: "fail-run", name: "bash", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 4, "tool.finished", {
+      callId: "tc-bad", agentId: "fail-run", name: "bash", status: "failed", durationMs: 4,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 5, "tool.started", {
+      callId: "tc-live", agentId: "fail-run", name: "read", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 6, "agent.updated", {
+      id: "fail-run", patch: { status: "failed" },
+    }));
+    const live = livePresence(graph);
+    expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::fail-run"]);
+    expect(Object.values(live.tools).map((tool) => `${tool.name}:${tool.status}`).sort()).toEqual(["bash:failed", "read:running"]);
   });
 });
