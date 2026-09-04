@@ -6,6 +6,17 @@ import { fileURLToPath } from "node:url";
 
 import { isConsumerNotice, type TelemetryDelta, type EventStore, type TelemetrySnapshot } from "./event-store.ts";
 
+export const DASHBOARD_TOKEN_LENGTH = 4;
+export const DASHBOARD_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/** Short, human-readable launch code. This is a loopback convenience gate, not strong authentication. */
+export function createDashboardToken(): string {
+  return Array.from(
+    { length: DASHBOARD_TOKEN_LENGTH },
+    () => DASHBOARD_TOKEN_ALPHABET[crypto.randomInt(DASHBOARD_TOKEN_ALPHABET.length)]!,
+  ).join("");
+}
+
 export interface FlowServerOptions {
   port: number;
   store: EventStore;
@@ -59,7 +70,7 @@ export function startServer(
     : optionsOrPort;
   const source = (legacySource ?? options.store) as unknown as SnapshotSource;
   const staticDir = options.staticDir ?? DEFAULT_STATIC_DIRS.find((dir) => fs.existsSync(dir)) ?? DEFAULT_STATIC_DIRS[0]!;
-  const token = options.token ?? crypto.randomBytes(32).toString("hex");
+  const token = options.token ?? createDashboardToken();
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const staleSweepMs = options.staleSweepMs ?? heartbeatMs;
   if (token.length === 0 || token.length > 256) throw new Error("token must be a non-empty value");
@@ -72,6 +83,9 @@ export function startServer(
 
   const server = http.createServer((req, res) => {
     applySecurityHeaders(res);
+    // The four-character code is only a loopback convenience gate. Reject arbitrary Host values
+    // so a DNS-rebinding origin cannot turn the browser into a same-origin token oracle.
+    if (!isLoopbackHost(req.headers.host)) return send(res, 400, "Bad Request", "text/plain; charset=utf-8");
     // A throw here escapes into the host process as an uncaught exception, so no
     // attacker-supplied request target may reach the parser unguarded.
     let requestUrl: URL;
@@ -96,7 +110,8 @@ export function startServer(
 
     if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
     if (pathname === "/health") return sendJson(res, { ok: !closed, clients: clients.size });
-    return serveStatic(res, staticDir, pathname, requestUrl.searchParams.has("token") ? token : undefined, req.method === "HEAD");
+    const landingToken = requestUrl.searchParams.get("token");
+    return serveStatic(res, staticDir, pathname, matchesToken(landingToken, token) ? token : undefined, req.method === "HEAD");
   });
 
   return new Promise((resolve, reject) => {
@@ -141,6 +156,10 @@ export function startServer(
   });
 }
 
+function isLoopbackHost(host: string | undefined): boolean {
+  return typeof host === "string" && /^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$/i.test(host);
+}
+
 function applySecurityHeaders(res: http.ServerResponse): void {
   res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -154,6 +173,10 @@ function authorized(req: http.IncomingMessage, url: URL, token: string): boolean
   const cookie = req.headers.cookie?.match(/(?:^|;\s*)flow_token=([^;]+)/)?.[1];
   const query = url.searchParams.get("token");
   const candidate = typeof supplied === "string" ? supplied : cookie ?? query;
+  return matchesToken(candidate, token);
+}
+
+function matchesToken(candidate: unknown, token: string): boolean {
   if (typeof candidate !== "string") return false;
   // timingSafeEqual compares BYTES and throws on a length mismatch; a code-unit
   // guard lets a non-ASCII candidate through and takes the host process down.

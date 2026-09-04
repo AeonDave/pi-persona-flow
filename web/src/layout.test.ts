@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry } from "../../src/reducer";
-import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messagesForSelection, modelLabel, rankCanvasTools, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
+import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messageRoute, messagesForSelection, modelLabel, rankCanvasTools, shouldAnimateTraffic, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
 import { livePresence } from "./state";
 
 const instance = (seq: number, type: "instance.started" | "agent.added", payload: TelemetryEvent["payload"]): TelemetryEvent => ({
@@ -167,6 +167,8 @@ describe("control-room layout", () => {
     expect(inFlightTraffic("replied")).toBe(false);
     expect(inFlightTraffic("failed")).toBe(false);
     expect(inFlightTraffic("rejected")).toBe(false);
+    expect(shouldAnimateTraffic("queued", false)).toBe(true);
+    expect(shouldAnimateTraffic("queued", true)).toBe(false);
 
     let graph = createGraphState();
     const started = (session: string, name: string) => ({
@@ -227,6 +229,8 @@ describe("control-room layout", () => {
     const traffic = messagesForSelection(graph.messages, { type: "instance", key: "pi-persona::alpha" });
     expect(traffic.map((message) => message.id)).toEqual(["ask-1"]);
     expect(graph.messages[0]?.fromKey).toBe("pi-persona::alpha::supervisor");
+    expect(messageRoute(traffic[0]!, { type: "instance", key: "pi-persona::alpha" })).toBe("supervisor → scout");
+    expect(messageRoute(traffic[0]!, { type: "agent", key: "pi-persona::alpha::scout" })).toBe("IN ← supervisor");
   });
 
   const toolCall = (seq: number, callId: string, agentId: string, name: string, status: "running" | "done" | "failed", durationMs?: number): TelemetryEvent => ({
@@ -376,5 +380,45 @@ describe("control-room layout", () => {
       && chip.x + chip.width <= agent.x + agent.width + 0.5
       && chip.y + chip.height <= agent.y + agent.height + 0.5
     )))).toBe(true);
+  });
+
+  it("keeps descendants inside their sibling subtree instead of stacking them", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "m", status: "active", pid: 1, contextPercent: 20, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", { id: "left", label: "left", kind: "delegate", status: "running" }));
+    graph = reduceTelemetry(graph, instance(3, "agent.added", { id: "right", label: "right", kind: "delegate", status: "running" }));
+    graph = reduceTelemetry(graph, instance(4, "agent.added", { id: "left-child", label: "left-child", kind: "subagent", status: "running", parentId: "left" }));
+    graph = reduceTelemetry(graph, instance(5, "agent.added", { id: "right-child", label: "right-child", kind: "subagent", status: "running", parentId: "right" }));
+
+    const children = computeLayout(graph, 721, 571).rects.filter((rect) => rect.label.endsWith("child"));
+    expect(children).toHaveLength(2);
+    const [left, right] = children;
+    const overlap = left!.x < right!.x + right!.width && left!.x + left!.width > right!.x
+      && left!.y < right!.y + right!.height && left!.y + left!.height > right!.y;
+    expect(overlap).toBe(false);
+  });
+
+  it("places the next instance row below a deep tree", () => {
+    let graph = createGraphState();
+    const started = (sessionId: string, displayName: string): TelemetryEvent => ({
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: `${sessionId}-1`, seq: 1, ts: 1000,
+      sessionId, workspaceId: "0123456789abcdef01234567", type: "instance.started",
+      payload: { displayName, persona: "dev", model: "m", status: "active", pid: 1, contextPercent: 20, exocomEnabled: true },
+    });
+    graph = reduceTelemetry(graph, started("alpha", "Alpha"));
+    graph = reduceTelemetry(graph, started("beta", "Beta"));
+    graph = reduceTelemetry(graph, started("gamma", "Gamma"));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", { id: "depth-1", label: "depth-1", kind: "delegate", status: "running" }));
+    graph = reduceTelemetry(graph, instance(3, "agent.added", { id: "depth-2", label: "depth-2", kind: "delegate", status: "running", parentId: "depth-1" }));
+    graph = reduceTelemetry(graph, instance(4, "agent.added", { id: "depth-3", label: "depth-3", kind: "delegate", status: "running", parentId: "depth-2" }));
+
+    const rects = computeLayout(graph, 721, 571).rects;
+    const deep = rects.find((rect) => rect.label === "depth-3")!;
+    const next = rects.find((rect) => rect.label === "Gamma")!;
+    const overlap = deep.x < next.x + next.width && deep.x + deep.width > next.x
+      && deep.y < next.y + next.height && deep.y + deep.height > next.y;
+    expect(overlap).toBe(false);
   });
 });

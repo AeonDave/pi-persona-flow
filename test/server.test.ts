@@ -45,6 +45,30 @@ test("API requires the per-server token and exposes security headers without COR
   });
 });
 
+test("the generated dashboard token is a four-character Base62 code", async () => {
+  await withServer(async (_url, token) => {
+    assert.match(token, /^[0-9A-Za-z]{4}$/);
+  });
+});
+
+test("only a valid landing token may mint the dashboard cookie", async () => {
+  await withServer(async (url, token) => {
+    const denied = await fetch(`${url}/?token=wrong`);
+    assert.equal(denied.status, 200, "the static shell remains public");
+    assert.equal(denied.headers.get("set-cookie"), null, "an invalid query must not disclose the real token");
+
+    const accepted = await fetch(`${url}/?token=${token}`);
+    const setCookie = accepted.headers.get("set-cookie") ?? "";
+    assert.match(setCookie, new RegExp(`^flow_token=${token};`));
+    assert.match(setCookie, /HttpOnly/);
+    assert.match(setCookie, /SameSite=Strict/);
+
+    const cookie = setCookie.split(";", 1)[0]!;
+    const authenticated = await fetch(`${url}/api/snapshot`, { headers: { Cookie: cookie } });
+    assert.equal(authenticated.status, 200);
+  });
+});
+
 test("stream replays deltas after Last-Event-ID and after query cursor", async () => {
   await withServer(async (url, token, store) => {
     store.append(event(1));
@@ -116,10 +140,10 @@ test("shutdown is idempotent and drops an active stream", async () => {
 });
 
 /** Issue a request target the WHATWG URL parser rejects; fetch() would normalise it away. */
-function rawRequest(port: number, target: string): Promise<string> {
+function rawRequest(port: number, target: string, host = "127.0.0.1"): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = connect(port, "127.0.0.1", () => {
-      socket.write(`GET ${target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n`);
+      socket.write(`GET ${target} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
     });
     socket.setEncoding("utf8");
     let text = "";
@@ -130,9 +154,19 @@ function rawRequest(port: number, target: string): Promise<string> {
   });
 }
 
+test("a non-loopback Host cannot use the short launch token", async () => {
+  await withServer(async (url, token) => {
+    const port = Number(new URL(url).port);
+    const denied = await rawRequest(port, `/api/snapshot?token=${token}`, "rebound.example");
+    assert.match(denied, /^HTTP\/1\.1 400 /);
+    const survived = await fetch(`${url}/api/snapshot?token=${token}`);
+    assert.equal(survived.status, 200);
+  });
+});
+
 test("a same-length non-ASCII token is refused without throwing out of the request listener", async () => {
   await withServer(async (url, token) => {
-    const candidate = "é".repeat(32) + "a".repeat(32);
+    const candidate = "é".repeat(token.length);
     assert.equal(candidate.length, token.length, "the probe must clear the code-unit guard");
     assert.notEqual(Buffer.byteLength(candidate), Buffer.byteLength(token), "the probe must differ in bytes");
     const denied = await fetch(`${url}/api/snapshot?token=${encodeURIComponent(candidate)}`);

@@ -18,6 +18,12 @@ test("entity and sequence keys include producer identity", () => {
   assert.equal(state.lastSeq["b::s"], 1);
 });
 
+test("composite identity escapes delimiter-bearing producer, session, and entity ids", () => {
+  assert.notEqual(entityKey("plug::in", "session"), entityKey("plug", "in::session"));
+  assert.notEqual(entityKey("plug", "session::run", "child"), entityKey("plug", "session", "run::child"));
+  assert.notEqual(entityKey("plug", "session", "name:part"), entityKey("plug", "session", "name%3Apart"));
+});
+
 test("peer snapshots remove peers absent from the newest snapshot", () => {
   let state = createGraphState();
   state = reduceTelemetry(state, event("a", "peers.snapshot", { peers: [{ sessionId: "dead", displayName: "dead", persona: "", model: "", contextPercent: 0, status: "online", sent: 0, received: 0 }] }));

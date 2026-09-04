@@ -1,23 +1,21 @@
 <h1 align="center">pi-persona-flow</h1>
 
 <p align="center">
-  A local, real-time <b>control room</b> for
-  <a href="https://github.com/AeonDave/pi-persona">pi-persona</a> —
+  A local, real-time <b>control room</b> for Pi plugin lifecycle telemetry —
   instances, delegated agents, tools, and live
   <code>intercom</code> / <code>exocom</code> traffic, on a token-gated loopback dashboard.
 </p>
 
-A Pi extension that watches the workspace telemetry log and draws what [pi-persona](https://github.com/AeonDave/pi-persona)
-is actually doing: every reporting Pi, nested orchestration, tool lifecycle, and directional
-message traffic. Edges animate only while a send is still `queued`; delivered history stays still.
-Lifecycle truth is emitted by the producer — this dashboard never infers orchestration from
-tool-result text.
+A Pi extension that watches the workspace telemetry log and draws what compatible plugins are
+actually doing: every reporting Pi, nested orchestration, tool lifecycle, and directional message
+traffic. [pi-persona](https://github.com/AeonDave/pi-persona) is the current rich producer, not a
+hard-coded contract owner. Edges animate only while a send is still `queued`; delivered history
+stays still, and the animation is disabled when the OS requests reduced motion. Lifecycle truth is
+emitted by the producer — this dashboard never infers orchestration from tool-result text.
 
-> **[pi-persona](https://github.com/AeonDave/pi-persona) is required.** Flow is a viewer, not a
-> producer. Without pi-persona there is no intercom, no exocom, no orchestration graph, and
-> `/dashboard` is an empty room. Install pi-persona first. The wire contract is vendor-neutral
-> (`pi:telemetry` v2), and flow does not import pi-persona, but in practice pi-persona is the
-> producer this package exists to show.
+> Flow is a viewer, not a producer. Install [pi-persona](https://github.com/AeonDave/pi-persona)
+> for the complete intercom/exocom/orchestration view available today, or use any plugin that emits
+> the vendor-neutral `pi:telemetry` v2 contract. Flow does not import or special-case pi-persona.
 >
 > Optional sibling: [pi-persona-mind](https://github.com/AeonDave/pi-persona-mind) (durable memory).
 > Flow does not depend on it.
@@ -25,7 +23,7 @@ tool-result text.
 ## Install
 
 ```bash
-# Required producer — install this first
+# Current full-featured producer (optional if another plugin emits pi:telemetry v2)
 pi install git:github.com/AeonDave/pi-persona
 
 # This dashboard
@@ -38,7 +36,8 @@ Restart Pi or `/reload`. Then, in any one session of the workspace:
 /dashboard
 ```
 
-That starts the loopback server and opens the **tokenized** URL. Do not type
+That starts the loopback server and opens a URL containing a random, case-sensitive four-character
+Base62 launch code, for example `?token=Ab0T`. Do not type
 `http://127.0.0.1:7874` by hand — the page loads, `/api/snapshot` returns 401, and the room stays
 empty. Use `/dashboard status` to copy the link if the browser did not open.
 
@@ -78,7 +77,9 @@ is the path.
 - nested agents (delegates, council, flow phases) and their tools;
 - **intercom** — supervisor ↔ child, inside one pi-persona run;
 - **exocom** — flat traffic between independent Pi instances in the same workspace;
-- a bounded, replayable event timeline and a selected-node inspector.
+- a bounded, replayable event timeline and a selected-node inspector;
+- click or keyboard-selectable cards with producer/session identity, derived live status, tool
+  history, and safe traffic metadata (direction, channel, size, reply linkage, and time).
 
 Selecting one instance scopes the canvas to **that stream's** messages and the peers it observed.
 Exocom from other instances does not leak through. Channel lines move only while telemetry says
@@ -100,7 +101,7 @@ pi -e ./src/extension.ts
 ## Architecture
 
 ```text
-pi-persona (required producer)
+Any compatible Pi plugin (pi-persona is the current rich producer)
   ├─ pi.events: pi:telemetry (+ legacy v1) ─ immediate local delivery
   └─ JSONL  <agent-dir>/telemetry/v2/<workspace>/<producer>/<session>.jsonl
                                          │
@@ -132,10 +133,16 @@ Key files:
 ## Security
 
 - binds only to `127.0.0.1`;
-- a random token gates API and SSE (minted per server start);
+- a random four-character Base62 launch code gates API and SSE and is minted per server start;
+- arbitrary `Host` headers are rejected to prevent DNS-rebinding access;
 - same-origin static assets, CSP, no wildcard CORS, no external fonts;
 - tails only appended file bytes and bounds unterminated lines;
 - deduplicates live-bus and JSONL copies by producer/session/event identity;
 - caps retained events, messages, and completed stream projections;
 - marks instances stale when heartbeats stop; LIVE topology hides stopped/stale Pi so a closed `--exocom` session does not linger as a card (REVIEW still scrubs the log);
 - Windows `/dashboard` opens via `rundll32` (never `cmd /c start`).
+
+The short code is intentionally a human-readable convenience gate for a read-only service bound to
+loopback, not strong authentication (four Base62 characters provide about 23.8 bits). Other local
+processes running as the same user should be treated as trusted; do not expose or proxy this server
+off-host.

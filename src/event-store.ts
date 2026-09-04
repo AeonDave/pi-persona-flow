@@ -1,5 +1,5 @@
 import { TELEMETRY_VERSION, type TelemetryEvent } from "../shared/protocol.ts";
-import { createGraphState, markStale, reduceTelemetry, type GraphState } from "./reducer.ts";
+import { createGraphState, entityKey, markStale, reduceTelemetry, type GraphState } from "./reducer.ts";
 
 export const DEFAULT_DELTA_LIMIT = 2_000;
 export const DEFAULT_STALE_AFTER_MS = 30_000;
@@ -196,7 +196,7 @@ export class EventStore {
 
   /** Apply one validated event. Duplicate event ids are ignored without consuming a cursor. */
   append(event: TelemetryEvent): number | undefined {
-    const sequenceKey = `${event.producerId}::${event.sessionId}`;
+    const sequenceKey = entityKey(event.producerId, event.sessionId);
     if (event.seq <= (this.state.lastSeq[sequenceKey] ?? 0)) return undefined;
     const dedupeKey = `${event.producerId}\u0000${event.sessionId}\u0000${event.id}`;
     if (this.eventIds.has(dedupeKey)) return undefined;

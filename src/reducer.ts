@@ -101,11 +101,18 @@ export const MAX_STREAMS = MAX_INACTIVE_STREAMS * STREAM_CEILING;
 /** Prune below a cap rather than to it, so one sort-and-rebuild amortizes over many later events. */
 const RETAIN_RATIO = 0.9;
 
-export function entityKey(producerId: string, sessionId: string, entityId?: string): string {
-  return entityId === undefined ? `${producerId}::${sessionId}` : `${producerId}::${sessionId}::${entityId}`;
+function keySegment(value: string): string {
+  // Keep ordinary ids readable while escaping the separator and its escape marker. Unlike
+  // encodeURIComponent this is total for JSON strings, including lone UTF-16 surrogates.
+  return value.replaceAll("%", "%25").replaceAll(":", "%3A");
 }
 
-function streamKey(producerId: string, sessionId: string): string { return `${producerId}::${sessionId}`; }
+export function entityKey(producerId: string, sessionId: string, entityId?: string): string {
+  const stream = `${keySegment(producerId)}::${keySegment(sessionId)}`;
+  return entityId === undefined ? stream : `${stream}::${keySegment(entityId)}`;
+}
+
+function streamKey(producerId: string, sessionId: string): string { return entityKey(producerId, sessionId); }
 
 export function createGraphState(): GraphState {
   return {

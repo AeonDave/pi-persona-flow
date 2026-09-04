@@ -31,6 +31,15 @@ test("EventStore assigns a global cursor, deduplicates, reduces, and notifies", 
   assert.deepEqual(store.backlog(0)?.map((d) => d.cursor), [1, 2]);
 });
 
+test("delimiter-bearing stream identities do not share a sequence cursor", () => {
+  const store = new EventStore(4);
+  const first = { ...event(1, "first:1"), producerId: "plug::in", sessionId: "session" };
+  const second = { ...event(1, "second:1"), producerId: "plug", sessionId: "in::session" };
+  assert.equal(store.append(first), 1);
+  assert.equal(store.append(second), 2);
+  assert.equal(Object.keys(store.snapshot().state.instances).length, 2);
+});
+
 test("EventStore backlog is bounded and reports an unreplayable cursor", () => {
   const store = new EventStore(2);
   for (let i = 1; i <= 3; i++) store.append(event(i));

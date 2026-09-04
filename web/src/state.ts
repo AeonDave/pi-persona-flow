@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { parseTelemetryEvent, type TelemetryEvent } from "../../shared/protocol";
-import { createGraphState, reduceTelemetry, type GraphState } from "../../src/reducer";
+import { createGraphState, entityKey, reduceTelemetry, type GraphState } from "../../src/reducer";
 
 export type ConnectionState = "connecting" | "live" | "offline";
 export type Attention = "all" | "attention";
@@ -165,6 +165,10 @@ export function liveStream(status: string): boolean {
   return status !== "stopped" && status !== "stale";
 }
 
+export function needsAttention(item: { status: string; contextPercent?: number }): boolean {
+  return ["failed", "waiting", "stale"].includes(item.status) || (item.contextPercent ?? 0) >= 85;
+}
+
 /** Concluded subagents stay in the JSONL (REVIEW still has them). LIVE is presence: done/stopped/
  *  failed runs are history. A failed stamp is not a reason to keep a finished card on the canvas —
  *  the operator still sees those errors on the tools of any run that is actually still going. */
@@ -193,6 +197,40 @@ function instanceKeyForPeer(peerKey: string): string {
   return producer && observed ? `${producer}::${observed}` : peerKey;
 }
 
+/** Preserve the hierarchy needed to render an alerting node while excluding unrelated branches. */
+export function attentionGraph(graph: GraphState): GraphState {
+  const visibleAgentKeys = new Set(
+    Object.entries(graph.agents).filter(([, agent]) => needsAttention(agent)).map(([key]) => key),
+  );
+  const pending = [...visibleAgentKeys];
+  while (pending.length > 0) {
+    const parentKey = graph.agents[pending.pop()!]?.parentKey;
+    if (parentKey && graph.agents[parentKey] && !visibleAgentKeys.has(parentKey)) {
+      visibleAgentKeys.add(parentKey);
+      pending.push(parentKey);
+    }
+  }
+
+  const sessions = new Set(
+    Object.entries(graph.instances).filter(([, instance]) => needsAttention(instance)).map(([key]) => key),
+  );
+  for (const key of visibleAgentKeys) {
+    const agent = graph.agents[key]!;
+    sessions.add(entityKey(agent.producerId, agent.sessionId));
+  }
+
+  const instances = Object.fromEntries(Object.entries(graph.instances).filter(([key]) => sessions.has(key)));
+  const agents = Object.fromEntries(Object.entries(graph.agents).filter(([key]) => visibleAgentKeys.has(key)));
+  const knownAgentKeys = new Set(Object.keys(graph.agents));
+  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => {
+    const session = entityKey(tool.producerId, tool.sessionId);
+    return sessions.has(session) && (visibleAgentKeys.has(tool.agentKey) || !knownAgentKeys.has(tool.agentKey));
+  }));
+  const peers = Object.fromEntries(Object.entries(graph.peers).filter(([key]) => peerObservedBy(key, sessions)));
+  const messages = graph.messages.filter((message) => sessions.has(entityKey(message.producerId, message.sessionId)));
+  return { ...graph, instances, agents, tools, peers, messages };
+}
+
 /**
  * LIVE canvas: a closed Pi stays in the JSONL log (REVIEW can still scrub it) but it is not
  * presence. Without this, every prior `--exocom` session in the workspace reappears as a card.
@@ -200,16 +238,16 @@ function instanceKeyForPeer(peerKey: string): string {
 export function livePresence(graph: GraphState): GraphState {
   const instanceEntries = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
-  const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
+  const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(entityKey(agent.producerId, agent.sessionId))));
   const liveToolOwners = new Set<string>();
   for (const tool of Object.values(graph.tools)) {
-    if (sessions.has(`${tool.producerId}::${tool.sessionId}`) && liveToolWork(tool.status)) liveToolOwners.add(tool.agentKey);
+    if (sessions.has(entityKey(tool.producerId, tool.sessionId)) && liveToolWork(tool.status)) liveToolOwners.add(tool.agentKey);
   }
   const agents = Object.fromEntries(Object.entries(roster).filter(([, agent]) => liveAgent(agent.status) || liveToolOwners.has(agent.key)));
   const liveAgentKeys = new Set(Object.keys(agents));
   const rosterKeys = new Set(Object.keys(roster));
   const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => {
-    if (!sessions.has(`${tool.producerId}::${tool.sessionId}`)) return false;
+    if (!sessions.has(entityKey(tool.producerId, tool.sessionId))) return false;
     if (liveAgentKeys.has(tool.agentKey)) return true;
     return !rosterKeys.has(tool.agentKey);
   }));
@@ -218,7 +256,7 @@ export function livePresence(graph: GraphState): GraphState {
     const known = graph.instances[instanceKeyForPeer(key)];
     return !known || liveStream(known.status);
   }));
-  const messages = graph.messages.filter((message) => sessions.has(`${message.producerId}::${message.sessionId}`));
+  const messages = graph.messages.filter((message) => sessions.has(entityKey(message.producerId, message.sessionId)));
   return { ...graph, instances: Object.fromEntries(instanceEntries), agents, tools, peers, messages };
 }
 
@@ -228,12 +266,12 @@ export function filterGraph(graph: GraphState, filters: Filters): GraphState {
   const instanceEntries = Object.entries(graph.instances).filter(([sessionId, instance]) =>
     (!filters.instance || sessionId === filters.instance) && (!filters.persona || instance.persona === filters.persona));
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
-  const agents = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(`${agent.producerId}::${agent.sessionId}`)));
-  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(`${tool.producerId}::${tool.sessionId}`)));
+  const agents = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(entityKey(agent.producerId, agent.sessionId))));
+  const tools = Object.fromEntries(Object.entries(graph.tools).filter(([, tool]) => sessions.has(entityKey(tool.producerId, tool.sessionId))));
   const peers = Object.fromEntries(Object.entries(graph.peers).filter(([key]) => peerObservedBy(key, sessions)));
   const messages = graph.messages.filter((message) => {
     if (filters.channel !== "all" && message.channel !== filters.channel) return false;
-    return sessions.has(`${message.producerId}::${message.sessionId}`);
+    return sessions.has(entityKey(message.producerId, message.sessionId));
   });
   return { ...graph, instances: Object.fromEntries(instanceEntries), agents, tools, peers, messages };
 }

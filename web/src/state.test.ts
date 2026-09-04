@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry, type GraphState } from "../../src/reducer";
-import { filterGraph, livePresence, useTimelineView, type Filters, type TimelineView } from "./state";
+import { attentionGraph, filterGraph, livePresence, useTimelineView, type Filters, type TimelineView } from "./state";
 
 /** The fold is the cost this view is measured by, so the test counts it rather than timing it. */
 vi.mock("../../src/reducer", async (importOriginal) => {
@@ -193,6 +193,35 @@ describe("instance filter", () => {
   it("does not let the other instance's exocom through just because the channel is exocom", () => {
     const scoped = filterGraph(workspaceGraph(), { ...ALL, instance: "pi-persona::alpha", channel: "exocom" });
     expect(scoped.messages.map((message) => message.id)).toEqual(["exo-a"]);
+  });
+});
+
+describe("attention view", () => {
+  it("keeps the owning instance and ancestor chain for an agent that needs attention", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "m", status: "active", pid: 1, contextPercent: 20, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 2, "agent.added", {
+      id: "parent", label: "parent", kind: "delegate", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 3, "agent.added", {
+      id: "waiting", label: "waiting", kind: "subagent", status: "waiting", parentId: "parent",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 4, "agent.added", {
+      id: "sibling", label: "sibling", kind: "subagent", status: "running",
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 5, "tool.started", {
+      callId: "sibling-tool", agentId: "sibling", name: "read", status: "running",
+    }));
+
+    const attention = attentionGraph(graph);
+    expect(Object.keys(attention.instances)).toEqual(["pi-persona::alpha"]);
+    expect(Object.keys(attention.agents).sort()).toEqual([
+      "pi-persona::alpha::parent",
+      "pi-persona::alpha::waiting",
+    ]);
+    expect(Object.keys(attention.tools)).toEqual([]);
   });
 });
 
