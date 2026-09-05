@@ -134,12 +134,17 @@ Key files:
 
 - binds only to `127.0.0.1`;
 - a random four-character Base62 launch code gates API and SSE and is minted per server start;
+- the landing page also drops the same code as an `HttpOnly` cookie named for the port it is serving,
+  because a cookie is scoped by host and never by port; any credential the request presents may
+  authorize it, so a stale or planted cookie cannot 401 a dashboard whose URL carries the right code;
 - arbitrary `Host` headers are rejected to prevent DNS-rebinding access;
+- concurrent SSE clients are capped, and one that stops reading is dropped rather than buffered inside
+  the host agent;
 - same-origin static assets, CSP, no wildcard CORS, no external fonts;
 - tails only appended file bytes and bounds unterminated lines;
 - deduplicates live-bus and JSONL copies by producer/session/event identity;
 - caps retained events, messages, and completed stream projections;
-- marks instances stale when heartbeats stop; LIVE topology hides stopped/stale Pi so a closed `--exocom` session does not linger as a card (REVIEW still scrubs the log);
+- marks instances stale when heartbeats stop and un-marks them when one arrives; LIVE topology hides stopped/stale Pi so a closed `--exocom` session does not linger as a card (REVIEW still scrubs the log);
 - Windows `/dashboard` opens via `rundll32` (never `cmd /c start`).
 
 The short code is intentionally a human-readable convenience gate for a read-only service bound to

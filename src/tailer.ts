@@ -39,6 +39,29 @@ export interface TelemetryTailerOptions {
   onError?: (error: unknown) => void;
 }
 
+/**
+ * What one tick needs to know about a log, with the identity taken from a BIGINT stat.
+ *
+ * `fs.Stats.ino` is a JS double, and an NTFS file reference is a 64-bit value that does not survive
+ * one: measured on this machine, ~5-35% of fresh files report an `ino` that differs from the exact
+ * value, and distinct files collide outright on the truncated number. Identity is what tells a
+ * compaction rename apart from an append, so a collision there makes the tailer keep its old offset
+ * and resume mid-file in the replacement — skipping the head, which is exactly where the producer
+ * parks its replay seeds. `birthtimeMs` is not a substitute: NTFS tunnelling carries a creation time
+ * across a rename onto the same name.
+ */
+export interface LogStat {
+  size: number;
+  mtimeMs: number;
+  identity: string;
+}
+
+/** Exported so the identity rule can be measured directly against real files on the host filesystem. */
+export function logStat(file: string): LogStat {
+  const stat = fs.statSync(file, { bigint: true });
+  return { size: Number(stat.size), mtimeMs: Number(stat.mtimeMs), identity: `${stat.dev}:${stat.ino}` };
+}
+
 interface FileState {
   offset: number;
   partial: Buffer;
@@ -83,8 +106,13 @@ export class TelemetryTailer {
     const cwdHash = options.cwd ? workspaceHash(options.cwd) : options.workspaceId;
     if (cwdHash !== options.workspaceId) throw new Error("workspaceId does not match cwd");
     this.directory = path.join(agentDir, "pi-persona", "flow", options.workspaceId);
+    // v1 sat inside the producer's own storage root, which was renamed `pi-persona` -> `persona`. No
+    // producer writes v1 any more, so both entries are pure legacy compatibility — but a migration moves
+    // a user's existing logs to the new root and dropping either name silently loses history the
+    // dashboard used to show. An absent root costs one ENOENT readdir a tick, so read both.
     this.directories = [
       path.join(agentDir, "telemetry", "v2", options.workspaceId),
+      path.join(agentDir, "persona", "flow", options.workspaceId),
       this.directory,
     ];
   }
@@ -157,7 +185,7 @@ export class TelemetryTailer {
 
     // Freshest first: a live stream must never queue behind cold session history.
     const oldest = Date.now() - this.retentionMs;
-    const ordered: Array<{ file: string; stat: fs.Stats }> = [];
+    const ordered: Array<{ file: string; stat: LogStat }> = [];
     for (const file of files) {
       const stat = this.statFile(file);
       if (stat && stat.mtimeMs >= oldest) ordered.push({ file, stat });
@@ -187,9 +215,9 @@ export class TelemetryTailer {
     }
   }
 
-  private statFile(file: string): fs.Stats | undefined {
+  private statFile(file: string): LogStat | undefined {
     try {
-      return fs.statSync(file);
+      return logStat(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.onError?.(error);
       return undefined;
@@ -197,8 +225,8 @@ export class TelemetryTailer {
   }
 
   /** Consume the next slice of one log and report how many bytes that spent. */
-  private readFile(file: string, stat: fs.Stats): number {
-    const identity = `${stat.dev}:${stat.ino}`;
+  private readFile(file: string, stat: LogStat): number {
+    const identity = stat.identity;
     let state = this.files.get(file);
     if (!state) {
       state = { offset: 0, partial: Buffer.alloc(0), identity, discardingPartial: false, missing: false };

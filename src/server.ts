@@ -9,6 +9,18 @@ import { isConsumerNotice, type TelemetryDelta, type EventStore, type TelemetryS
 export const DASHBOARD_TOKEN_LENGTH = 4;
 export const DASHBOARD_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+/**
+ * A stalled SSE client's frames queue in the host Pi process, which is the user's agent session and
+ * not a disposable web server. Past this much unflushed output the connection is dropped: EventSource
+ * reconnects on its own and re-syncs from a fresh snapshot, which is strictly better than growing the
+ * agent's heap for a tab that stopped reading.
+ */
+export const MAX_STREAM_BUFFER_BYTES = 4 * 1024 * 1024;
+/** Concurrent /api/stream clients. A dashboard holds one; the ceiling only bounds a runaway. */
+export const MAX_STREAM_CLIENTS = 32;
+/** Cookie headers are attacker-influenced (any sibling loopback origin can add a `Path=/api` copy). */
+const MAX_COOKIE_CANDIDATES = 8;
+
 /** Short, human-readable launch code. This is a loopback convenience gate, not strong authentication. */
 export function createDashboardToken(): string {
   return Array.from(
@@ -26,6 +38,10 @@ export interface FlowServerOptions {
   heartbeatMs?: number;
   /** Override how often silent streams are aged out; defaults to the keep-alive interval. */
   staleSweepMs?: number;
+  /** Override the unflushed-output ceiling that drops a stalled stream; defaults to 4 MiB. */
+  maxStreamBufferBytes?: number;
+  /** Override the concurrent /api/stream ceiling; defaults to 32. */
+  maxStreamClients?: number;
 }
 
 export interface FlowServer {
@@ -73,13 +89,20 @@ export function startServer(
   const token = options.token ?? createDashboardToken();
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const staleSweepMs = options.staleSweepMs ?? heartbeatMs;
+  const maxStreamBufferBytes = options.maxStreamBufferBytes ?? MAX_STREAM_BUFFER_BYTES;
+  const maxStreamClients = options.maxStreamClients ?? MAX_STREAM_CLIENTS;
   if (token.length === 0 || token.length > 256) throw new Error("token must be a non-empty value");
   if (!Number.isFinite(heartbeatMs) || heartbeatMs < 1) throw new RangeError("heartbeatMs must be positive");
   if (!Number.isFinite(staleSweepMs) || staleSweepMs < 1) throw new RangeError("staleSweepMs must be positive");
+  if (!Number.isFinite(maxStreamBufferBytes) || maxStreamBufferBytes < 1) throw new RangeError("maxStreamBufferBytes must be positive");
+  if (!Number.isSafeInteger(maxStreamClients) || maxStreamClients < 1) throw new RangeError("maxStreamClients must be positive");
 
   const clients = new Map<http.ServerResponse, () => void>();
   let closed = false;
   let closePromise: Promise<void> | undefined;
+  // Named per port at listen time. A cookie cannot be port-scoped over http, so a shared name would
+  // put every loopback dashboard in one slot; the name is the only part of the tuple we control.
+  let cookieName = "flow_token";
 
   const server = http.createServer((req, res) => {
     applySecurityHeaders(res);
@@ -98,12 +121,13 @@ export function startServer(
 
     if (pathname.startsWith("/api/")) {
       if (req.method !== "GET") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
-      if (!authorized(req, requestUrl, token)) return unauthorized(res);
+      if (!authorized(req, requestUrl, token, cookieName)) return unauthorized(res);
       if (pathname === "/api/snapshot") {
         return sendJson(res, source.snapshot());
       }
       if (pathname === "/api/stream") {
-        return openStream(req, res, source, clients, requestUrl, heartbeatMs);
+        if (clients.size >= maxStreamClients) return send(res, 503, "Too Many Streams", "text/plain; charset=utf-8");
+        return openStream(req, res, source, clients, requestUrl, heartbeatMs, maxStreamBufferBytes);
       }
       return send(res, 404, "Not Found", "text/plain; charset=utf-8");
     }
@@ -111,7 +135,7 @@ export function startServer(
     if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
     if (pathname === "/health") return sendJson(res, { ok: !closed, clients: clients.size });
     const landingToken = requestUrl.searchParams.get("token");
-    return serveStatic(res, staticDir, pathname, matchesToken(landingToken, token) ? token : undefined, req.method === "HEAD");
+    return serveStatic(res, staticDir, pathname, matchesToken(landingToken, token) ? token : undefined, req.method === "HEAD", cookieName);
   });
 
   return new Promise((resolve, reject) => {
@@ -122,6 +146,7 @@ export function startServer(
       const address = server.address();
       const port = typeof address === "object" && address ? address.port : options.port;
       const baseUrl = `http://127.0.0.1:${port}`;
+      cookieName = `flow_token_${port}`;
       // Ageing a stream out is a wall-clock event with no producer to trigger it, so the dashboard
       // has to drive it on its own tick or a crashed producer never leaves a connected client's
       // screen. Unref'd so the host process can still exit while a session is idle.
@@ -140,8 +165,12 @@ export function startServer(
           if (closePromise) return closePromise;
           closed = true;
           clearInterval(sweep);
-          for (const [client, unsubscribe] of clients) {
-            unsubscribe();
+          // Each client's OWN teardown, not half of it. Ending the response without disarming its
+          // heartbeat left the interval armed against a finished stream, and the next tick's write
+          // raised ERR_STREAM_WRITE_AFTER_END on a response with no `error` listener — an uncaught
+          // exception that took the host Pi session down with the dashboard.
+          for (const [client, cleanup] of [...clients]) {
+            cleanup();
             client.end();
           }
           clients.clear();
@@ -167,13 +196,36 @@ function applySecurityHeaders(res: http.ServerResponse): void {
   res.setHeader("X-Frame-Options", "DENY");
 }
 
-function authorized(req: http.IncomingMessage, url: URL, token: string): boolean {
+/**
+ * Any presented credential may authorize the request; none of them may veto the others.
+ *
+ * Ranking them was the bug. A cookie is scoped by HOST and never by port (RFC 6265 §8.5), so every
+ * `http://127.0.0.1:*` origin shares one `flow_token` slot — and a second Pi session lands on a second
+ * port whenever 7874 is taken. With the cookie outranking the URL, the last dashboard opened silently
+ * 401'd every other one even though each tab carried its own correct token in its own query string. A
+ * sibling loopback page could do the same on purpose by planting a longer-path copy, which sorts first
+ * (§5.4) and so won a first-match parse. An empty `X-Flow-Token:` header could likewise veto a valid
+ * `?token=`. Checking every candidate makes a wrong or planted one merely irrelevant.
+ */
+function authorized(req: http.IncomingMessage, url: URL, token: string, cookieName: string): boolean {
   const bearer = req.headers.authorization;
-  const supplied = bearer?.startsWith("Bearer ") ? bearer.slice(7) : req.headers["x-flow-token"];
-  const cookie = req.headers.cookie?.match(/(?:^|;\s*)flow_token=([^;]+)/)?.[1];
-  const query = url.searchParams.get("token");
-  const candidate = typeof supplied === "string" ? supplied : cookie ?? query;
-  return matchesToken(candidate, token);
+  const header = bearer?.startsWith("Bearer ") ? bearer.slice(7) : req.headers["x-flow-token"];
+  if (matchesToken(url.searchParams.get("token"), token)) return true;
+  if (matchesToken(header, token)) return true;
+  return cookieValues(req.headers.cookie, cookieName).some((value) => matchesToken(value, token));
+}
+
+/** Every `<name>=` in a Cookie header, not just the first one a regex happens to reach. */
+function cookieValues(header: string | undefined, name: string): string[] {
+  if (typeof header !== "string") return [];
+  const values: string[] = [];
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0 || part.slice(0, eq).trim() !== name) continue;
+    values.push(part.slice(eq + 1).trim());
+    if (values.length >= MAX_COOKIE_CANDIDATES) break;
+  }
+  return values;
 }
 
 function matchesToken(candidate: unknown, token: string): boolean {
@@ -211,6 +263,7 @@ function openStream(
   clients: Map<http.ServerResponse, () => void>,
   url: URL,
   heartbeatMs: number,
+  maxBufferBytes: number,
 ): void {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -220,10 +273,28 @@ function openStream(
   res.write(": connected\n\n");
 
   let active = true;
-  const heartbeat = setInterval(() => {
+  let unsubscribe: () => void = () => undefined;
+  const cleanup = (): void => {
+    if (!active) return;
+    active = false;
+    clearInterval(heartbeat);
+    unsubscribe();
+    clients.delete(res);
+  };
+  /**
+   * Every frame goes through here so no write can outrun the client reading it. `res.write` returning
+   * false means the kernel buffer is full and Node is queueing in userspace — that queue is the host
+   * agent's heap, and a backgrounded tab holding an EventSource is the ordinary way to fill it. Past
+   * the ceiling the connection is dropped rather than buffered; EventSource reconnects and re-syncs.
+   */
+  const write = (frame: string): void => {
     if (!active || res.destroyed) return;
-    res.write(": heartbeat\n\n");
-  }, heartbeatMs);
+    if (!res.write(frame) && res.writableLength > maxBufferBytes) {
+      cleanup();
+      res.destroy();
+    }
+  };
+  const heartbeat = setInterval(() => write(": heartbeat\n\n"), heartbeatMs);
   heartbeat.unref?.();
   let lastSnapshotCursor = -1;
   /**
@@ -235,7 +306,7 @@ function openStream(
     if (!active || res.destroyed || (snapshot?.cursor ?? source.cursor) === lastSnapshotCursor) return;
     const frame = snapshot ?? source.snapshot();
     lastSnapshotCursor = frame.cursor;
-    res.write(`id: ${frame.cursor}\nevent: snapshot\ndata: ${JSON.stringify(frame)}\n\n`);
+    write(`id: ${frame.cursor}\nevent: snapshot\ndata: ${JSON.stringify(frame)}\n\n`);
   };
   const sendDelta = (delta: TelemetryDelta, snapshot?: TelemetrySnapshot): void => {
     if (!active || res.destroyed) return;
@@ -243,10 +314,10 @@ function openStream(
     // over as a telemetry delta. It ships as the authoritative snapshot instead — exactly what
     // /api/snapshot would answer — so a stream client converges instead of diverging from it.
     if (isConsumerNotice(delta.event)) return sendSnapshot(snapshot);
-    res.write(`id: ${delta.cursor}\nevent: telemetry\ndata: ${JSON.stringify(delta)}\n\n`);
+    write(`id: ${delta.cursor}\nevent: telemetry\ndata: ${JSON.stringify(delta)}\n\n`);
   };
-  const unsubscribe = source.subscribe((delta, snapshot) => sendDelta(delta, snapshot));
-  clients.set(res, unsubscribe);
+  unsubscribe = source.subscribe((delta, snapshot) => sendDelta(delta, snapshot));
+  clients.set(res, cleanup);
   const lastHeader = req.headers["last-event-id"];
   const rawCursor = (typeof lastHeader === "string" ? lastHeader : url.searchParams.get("after") ?? url.searchParams.get("lastEventId")) ?? "";
   const cursor = /^\d+$/.test(rawCursor) ? Number(rawCursor) : undefined;
@@ -257,15 +328,11 @@ function openStream(
     sendSnapshot();
   }
 
-  const cleanup = (): void => {
-    if (!active) return;
-    active = false;
-    clearInterval(heartbeat);
-    unsubscribe();
-    clients.delete(res);
-  };
   req.on("close", cleanup);
   res.on("close", cleanup);
+  // Without a listener Node re-emits a stream write failure as an uncaught exception, so a client
+  // that dies mid-frame would end the user's agent session rather than its own connection.
+  res.on("error", cleanup);
 }
 
 function serveStatic(
@@ -274,6 +341,7 @@ function serveStatic(
   pathname: string,
   token: string | undefined,
   headOnly: boolean,
+  cookieName: string,
 ): void {
   let decoded: string;
   try {
@@ -291,7 +359,7 @@ function serveStatic(
   } catch {
     return send(res, 404, "Not Found", "text/plain; charset=utf-8");
   }
-  if (token) res.setHeader("Set-Cookie", `flow_token=${token}; HttpOnly; SameSite=Strict; Path=/`);
+  if (token) res.setHeader("Set-Cookie", `${cookieName}=${token}; HttpOnly; SameSite=Strict; Path=/`);
   res.statusCode = 200;
   res.setHeader("Content-Type", mimeType(file));
   res.setHeader("Cache-Control", "no-store");

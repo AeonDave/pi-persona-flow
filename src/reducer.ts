@@ -22,6 +22,9 @@ export interface InstanceView extends InstanceDescriptor {
   startedAt: number;
   updatedAt: number;
   stoppedReason?: string;
+  /** The last status the PRODUCER itself reported, kept while this consumer overwrites `status` with
+   *  its own "stale" guess so a later heartbeat can put the producer's own word back. */
+  reportedStatus?: string;
 }
 
 export interface AgentView extends AgentDescriptor {
@@ -161,7 +164,9 @@ export function markStale(state: GraphState, now: number, staleAfterMs: number):
     // its own status vocabulary, and a silent stream must age out whatever word it last used.
     if (!terminalStream(instance.status) && now - instance.updatedAt >= staleAfterMs) {
       if (instances === previous.instances) instances = { ...previous.instances };
-      instances[key] = { ...instance, status: "stale" };
+      // Only a non-stale status reaches here (terminalStream above), so this always captures the
+      // producer's own word rather than a previous guess of ours.
+      instances[key] = { ...instance, status: "stale", reportedStatus: instance.status };
       staled.push([key, instance.producerId]);
     }
   }
@@ -174,7 +179,9 @@ function terminalStream(status: InstanceStatus): boolean {
   return status === "stopped" || status === "stale";
 }
 
-function fallbackInstance(producerId: string, sessionId: string, ts: number): InstanceView {
+/** The card a stream gets when it reports work without ever describing itself. Nothing obliges a
+ *  producer to emit instance.*, so both the reducer and the LIVE presence view need this shape. */
+export function fallbackInstance(producerId: string, sessionId: string, ts: number): InstanceView {
   return {
     producerId,
     sessionId,
@@ -492,9 +499,19 @@ export function reduceTelemetry(state: GraphState, event: TelemetryEvent): Graph
     case "instance.updated":
     case "instance.heartbeat": {
       const current = previous.instances[streamKey(producerId, event.sessionId)] ?? fallbackInstance(producerId, event.sessionId, event.ts);
+      const merged: InstanceView = { ...current, ...event.payload, producerId, updatedAt: event.ts };
+      // "stale" is minted by this consumer, never signed by a producer, and nothing else clears it. A
+      // heartbeat is proof of life, but the contract lets its payload carry only what changed — so a
+      // heartbeat without a `status` key used to advance `updatedAt` while leaving our own guess in
+      // place, and `terminalStream("stale")` then kept markStale from ever revisiting it. The stream
+      // stayed live on the wire and gone from the canvas for the rest of the session.
+      if (current.status === "stale" && event.payload.status === undefined) {
+        merged.status = current.reportedStatus ?? "running";
+      }
+      if (merged.status !== "stale") delete merged.reportedStatus;
       next.instances = {
         ...previous.instances,
-        [streamKey(producerId, event.sessionId)]: { ...current, ...event.payload, producerId, updatedAt: event.ts },
+        [streamKey(producerId, event.sessionId)]: merged,
       };
       break;
     }

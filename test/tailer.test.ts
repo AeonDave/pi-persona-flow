@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 import { EventStore } from "../src/event-store.ts";
 import { entityKey } from "../src/reducer.ts";
-import { MAX_PARTIAL_LINE_BYTES, MAX_READ_BYTES, TelemetryTailer, workspaceHash } from "../src/tailer.ts";
+import { logStat, MAX_PARTIAL_LINE_BYTES, MAX_READ_BYTES, TelemetryTailer, workspaceHash } from "../src/tailer.ts";
 import { TELEMETRY_VERSION, type TelemetryEvent } from "../shared/protocol.ts";
 
 function event(workspaceId: string, seq = 1): TelemetryEvent {
@@ -108,6 +108,28 @@ test("TelemetryTailer dual-reads the neutral v2 producer namespace", () => {
   writeFileSync(join(dir, "s.jsonl"), `${JSON.stringify({ ...event(f.workspaceId), producerId: "other.plugin", producerVersion: "2.0.0", id: "other.plugin:s:1" })}\n`);
   tailer.start();
   assert.equal(store.cursor, 1);
+  tailer.stop();
+});
+
+/**
+ * v1 logs live under the plugin's storage root, and that root was renamed `pi-persona` -> `persona`.
+ * A user's old logs move with the root, so a reader that knows only the pre-rename name drops history
+ * it used to show. Both names are read, and a user mid-migration can legitimately have logs under each.
+ */
+test("TelemetryTailer reads v1 logs under both the pre- and post-rename storage root", () => {
+  const f = fixture();
+  const store = new EventStore();
+  const tailer = new TelemetryTailer({ store, agentDir: f.agentDir, workspaceId: f.workspaceId, pollMs: 0 });
+  const renamed = join(f.agentDir, "persona", "flow", f.workspaceId);
+  mkdirSync(renamed, { recursive: true });
+  writeFileSync(join(f.dir, "old.jsonl"), `${JSON.stringify({ ...event(f.workspaceId), sessionId: "pre-rename", id: "pre-rename:1" })}
+`);
+  writeFileSync(join(renamed, "new.jsonl"), `${JSON.stringify({ ...event(f.workspaceId), sessionId: "post-rename", id: "post-rename:1" })}
+`);
+  tailer.start();
+  const instances = store.snapshot().state.instances;
+  assert.ok(instances["pi-persona::pre-rename"], "a log under the pre-rename storage root was dropped");
+  assert.ok(instances["pi-persona::post-rename"], "a log under the post-rename storage root was dropped");
   tailer.stop();
 });
 
@@ -472,4 +494,27 @@ test("TelemetryTailer forgets a log that stays gone", () => {
   tailer.scanNow();
   assert.equal(files.has(file), false, "a deleted log kept its state past the grace scan");
   tailer.stop();
+});
+
+test("a log's identity is the exact inode, not a truncated double", () => {
+  // Identity is the only thing that tells a compaction rename apart from an append, and `fs.Stats.ino`
+  // is a JS double. An NTFS file reference is a 64-bit value that does not survive one: distinct files
+  // alias onto the same number, and a tailer that misses a replacement keeps its old offset and
+  // resumes mid-file — skipping the head, which is exactly where the producer parks its replay seeds.
+  const dir = mkdtempSync(join(tmpdir(), "flow-ino-"));
+  let lossy: string | undefined;
+  let first: string | undefined;
+  for (let index = 0; index < 600 && lossy === undefined; index += 1) {
+    const file = join(dir, `probe-${index}.jsonl`);
+    writeFileSync(file, "{}\n");
+    first ??= file;
+    if (BigInt(statSync(file).ino) !== statSync(file, { bigint: true }).ino) lossy = file;
+  }
+  const probe = lossy ?? first!;
+  const exact = statSync(probe, { bigint: true });
+  assert.equal(logStat(probe).identity, `${exact.dev}:${exact.ino}`);
+  if (lossy) {
+    const truncated = statSync(lossy);
+    assert.notEqual(logStat(lossy).identity, `${truncated.dev}:${truncated.ino}`, "the truncated value is a different file's answer");
+  }
 });

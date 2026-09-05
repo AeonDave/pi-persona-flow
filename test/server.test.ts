@@ -59,7 +59,10 @@ test("only a valid landing token may mint the dashboard cookie", async () => {
 
     const accepted = await fetch(`${url}/?token=${token}`);
     const setCookie = accepted.headers.get("set-cookie") ?? "";
-    assert.match(setCookie, new RegExp(`^flow_token=${token};`));
+    // Port-scoped by name, because a cookie is scoped by HOST and never by port (RFC 6265 s8.5): a
+    // shared name puts every `http://127.0.0.1:*` dashboard in one slot, and a second Pi session lands
+    // on a second port whenever the default one is taken.
+    assert.match(setCookie, new RegExp(`^flow_token_${new URL(url).port}=${token};`));
     assert.match(setCookie, /HttpOnly/);
     assert.match(setCookie, /SameSite=Strict/);
 
@@ -67,6 +70,104 @@ test("only a valid landing token may mint the dashboard cookie", async () => {
     const authenticated = await fetch(`${url}/api/snapshot`, { headers: { Cookie: cookie } });
     assert.equal(authenticated.status, 200);
   });
+});
+
+test("no ambient credential can veto the token the dashboard URL carries", async () => {
+  await withServer(async (url, token) => {
+    const port = new URL(url).port;
+    const name = `flow_token_${port}`;
+    // A wrong cookie used to OUTRANK the query, so the last dashboard opened silently 401'd every
+    // other one; a sibling loopback page could plant the same denial on purpose with a `Path=/api`
+    // copy, which sorts first and so won a first-match parse.
+    const clobbered = await fetch(`${url}/api/snapshot?token=${token}`, { headers: { Cookie: `${name}=WRNG` } });
+    assert.equal(clobbered.status, 200, "the token in the URL must stand on its own");
+
+    const planted = await fetch(`${url}/api/snapshot?token=${token}`, { headers: { Cookie: `${name}=evil; ${name}=${token}` } });
+    assert.equal(planted.status, 200, "a planted duplicate must not shadow the real cookie");
+
+    // An empty header is a string, and short-circuiting on its type suppressed both fallbacks.
+    const emptyHeader = await fetch(`${url}/api/snapshot?token=${token}`, { headers: { "X-Flow-Token": "" } });
+    assert.equal(emptyHeader.status, 200, "an empty credential is absent, not a rejection");
+
+    const nothing = await fetch(`${url}/api/snapshot`, { headers: { Cookie: `${name}=WRNG` } });
+    assert.equal(nothing.status, 401, "a wrong credential still authorizes nothing on its own");
+  });
+});
+
+test("a stream that dies mid-frame is dropped, not raised at the host", async () => {
+  const store = new EventStore();
+  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-disarm-"));
+  writeFileSync(join(staticDir, "index.html"), "ok");
+  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 5 });
+  const socket = connect(server.port, "127.0.0.1");
+  await new Promise((done) => socket.once("connect", done));
+  const crlf = String.fromCharCode(13, 10);
+  socket.write(`GET /api/stream?token=${server.token} HTTP/1.1${crlf}Host: 127.0.0.1${crlf}${crlf}`);
+  socket.pause();
+  for (let waited = 0; server.clientCount() === 0 && waited < 2_000; waited += 20) await new Promise((done) => setTimeout(done, 20));
+  assert.equal(server.clientCount(), 1);
+
+  const failures: unknown[] = [];
+  const record = (error: unknown): void => { failures.push(error); };
+  process.on("uncaughtException", record);
+  try {
+    // A reset connection, which is what a browser tab closed mid-frame looks like. The host here is
+    // the user's long-lived agent, not a disposable web server, so a write failure has to end the
+    // connection and nothing else. Node's http server currently destroys the response on a socket
+    // error by itself, so this passes with or without the explicit `error` listener in openStream —
+    // it pins the OUTCOME, and the listener is there so the outcome does not depend on that.
+    const filler = "d".repeat(900);
+    socket.resetAndDestroy();
+    for (let seq = 1; seq <= 4_000; seq += 1) store.append({ ...event(seq), payload: { contextPercent: seq % 100, displayName: filler } });
+    await new Promise((done) => setTimeout(done, 80));
+    assert.deepEqual(failures.map((error) => (error as Error).message), []);
+    assert.equal(server.clientCount(), 0, "the dead stream is forgotten");
+  } finally {
+    process.off("uncaughtException", record);
+    socket.destroy();
+    await server.close();
+  }
+});
+
+test("a stream that stops reading is dropped instead of buffered without bound", async () => {
+  const store = new EventStore();
+  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-backpressure-"));
+  writeFileSync(join(staticDir, "index.html"), "ok");
+  const server = await startServer({ port: 0, store, staticDir, maxStreamBufferBytes: 1 });
+  try {
+    // A socket that never reads: the frames pile up in the host process, which is the user's agent
+    // session and not a disposable web server. A backgrounded browser tab is the ordinary way there.
+    const socket = connect(server.port, "127.0.0.1");
+    await new Promise((done) => socket.once("connect", done));
+    const crlf = String.fromCharCode(13, 10);
+    socket.write(`GET /api/stream?token=${server.token} HTTP/1.1${crlf}Host: 127.0.0.1${crlf}${crlf}`);
+    socket.pause();
+    for (let waited = 0; server.clientCount() === 0 && waited < 2_000; waited += 20) await new Promise((done) => setTimeout(done, 20));
+    assert.equal(server.clientCount(), 1);
+    for (let seq = 1; seq <= 400 && server.clientCount() > 0; seq += 1) store.append(event(seq));
+    assert.equal(server.clientCount(), 0, "the stalled client is dropped, not buffered");
+    socket.destroy();
+  } finally {
+    await server.close();
+  }
+});
+
+test("concurrent streams are capped instead of unbounded", async () => {
+  const store = new EventStore();
+  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-cap-"));
+  writeFileSync(join(staticDir, "index.html"), "ok");
+  const server = await startServer({ port: 0, store, staticDir, maxStreamClients: 2 });
+  const open: Response[] = [];
+  try {
+    for (let index = 0; index < 2; index += 1) open.push(await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`));
+    assert.equal(server.clientCount(), 2);
+    const refused = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`);
+    assert.equal(refused.status, 503);
+    await refused.body?.cancel();
+  } finally {
+    for (const response of open) await response.body?.cancel().catch(() => undefined);
+    await server.close();
+  }
 });
 
 test("stream replays deltas after Last-Event-ID and after query cursor", async () => {

@@ -4,7 +4,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry, type GraphState } from "../../src/reducer";
-import { attentionGraph, filterGraph, livePresence, useTimelineView, type Filters, type TimelineView } from "./state";
+import { attentionGraph, filterGraph, livePresence, TIMELINE_WINDOW, useTimelineView, type Filters, type TimelineView } from "./state";
 
 /** The fold is the cost this view is measured by, so the test counts it rather than timing it. */
 vi.mock("../../src/reducer", async (importOriginal) => {
@@ -89,6 +89,26 @@ describe("review mode", () => {
     const stepped = timeline.show(live, 28).graph;
     expect(percentOf(stepped)).toBe(29);
     expect(folds.mock.calls).toHaveLength(4);
+    timeline.unmount();
+  });
+
+  it("seeks backwards from a checkpoint instead of refolding the whole window", () => {
+    const timeline = mountTimeline();
+    const many = Array.from({ length: 600 }, (_, index) => event(index + 2, "instance.updated", { contextPercent: index + 2 }));
+    const live = [started, ...many].reduce((graph, next) => reduceTelemetry(graph, next), createGraphState());
+    timeline.show(live, undefined);
+    const offset = live.events.length - TIMELINE_WINDOW;
+    folds.mockClear();
+    expect(percentOf(timeline.show(live, TIMELINE_WINDOW - 1).graph)).toBe(live.events.length);
+    expect(folds.mock.calls).toHaveLength(live.events.length);
+
+    folds.mockClear();
+    // The replay cache only resumed FORWARDS, so any leftward move restarted from an empty graph — and
+    // a range input fires one onChange per step, so a normal drag paid a full re-reduction per notch,
+    // synchronously inside render. Checkpoints bound the seek to one block of the log.
+    expect(percentOf(timeline.show(live, 0).graph)).toBe(offset + 1);
+    expect(folds.mock.calls.length).toBeGreaterThan(0);
+    expect(folds.mock.calls.length).toBeLessThanOrEqual(250);
     timeline.unmount();
   });
 
@@ -300,5 +320,39 @@ describe("live presence", () => {
     const live = livePresence(graph);
     expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::fail-run"]);
     expect(Object.values(live.tools).map((tool) => `${tool.name}:${tool.status}`).sort()).toEqual(["bash:failed", "read:running"]);
+  });
+
+  it("re-roots a running child whose parent was pruned", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, v2("alpha", 1, "instance.started", {
+      displayName: "dev", persona: "dev", model: "m", status: "active", pid: 1, contextPercent: 10, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, v2("alpha", 2, "agent.added", { id: "parent", label: "parent", kind: "subagent", status: "running" }));
+    graph = reduceTelemetry(graph, v2("alpha", 3, "agent.added", { id: "child", label: "child", kind: "subagent", status: "running", parentId: "parent" }));
+    graph = reduceTelemetry(graph, v2("alpha", 4, "agent.updated", { id: "parent", patch: { status: "done" } }));
+
+    // computeLayout reaches agents only by walking DOWN from the roots, so a survivor pointing at a
+    // parent that is no longer in the map is never visited: it and its whole subtree drop off the
+    // canvas while the rail still counts them, and REVIEW — which does not prune — draws it anyway.
+    const live = livePresence(graph);
+    expect(Object.keys(live.agents)).toEqual(["pi-persona::alpha::child"]);
+    expect(live.agents["pi-persona::alpha::child"]?.parentKey).toBeUndefined();
+    expect(graph.agents["pi-persona::alpha::child"]?.parentKey).toBe("pi-persona::alpha::parent");
+  });
+
+  it("mints a card for a stream that reports work but never describes itself", () => {
+    // Nothing in the contract obliges a producer to emit instance.* — the reducer bounds its per-stream
+    // maps against its own registry for exactly that reason — but every card is drawn from `instances`,
+    // so such a stream used to render as "Awaiting Pi telemetry": blank, not degraded.
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, { ...v2("solo", 1, "agent.added", { id: "run", label: "run", kind: "subagent", status: "running" }), producerId: "other-plugin" } as TelemetryEvent);
+    graph = reduceTelemetry(graph, { ...v2("solo", 2, "tool.started", { callId: "tc", agentId: "run", name: "read", status: "running" }), producerId: "other-plugin" } as TelemetryEvent);
+    expect(Object.keys(graph.instances)).toEqual([]);
+
+    const live = livePresence(graph);
+    expect(Object.keys(live.instances)).toEqual(["other-plugin::solo"]);
+    expect(live.instances["other-plugin::solo"]?.displayName).toBe("solo");
+    expect(Object.keys(live.agents)).toEqual(["other-plugin::solo::run"]);
+    expect(Object.keys(live.tools)).toHaveLength(1);
   });
 });

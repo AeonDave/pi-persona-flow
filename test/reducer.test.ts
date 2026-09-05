@@ -378,3 +378,29 @@ test("a folded registry without its clock resumes above the stamps it already ho
   const state = reduceTelemetry(legacy, event("instance.started", instance));
   assert.ok((state.streams[entityKey("pi-persona", "s1")]?.seen ?? 0) > 40, "a new arrival must not rank as older than a stamp already in the registry");
 });
+
+test("a stale stream comes back on a heartbeat that reports no status of its own", () => {
+  const KEY = entityKey("pi-persona", "s1");
+  let state = reduceTelemetry(createGraphState(), event("instance.started", { ...instance, status: "busy" }));
+  state = markStale(state, 1_700_000_100_000, 100);
+  assert.equal(state.instances[KEY]?.status, "stale");
+
+  // The contract types a heartbeat payload as Partial<InstanceDescriptor>, so carrying only what
+  // changed is correct. "stale" is minted by this consumer and nothing else clears it, so a heartbeat
+  // without a `status` key used to advance updatedAt and leave the guess standing — and terminalStream
+  // treats "stale" as terminal, so markStale never revisited it. The stream stayed live on the wire
+  // and gone from the LIVE canvas for the rest of the session.
+  state = reduceTelemetry(state, event("instance.heartbeat", { contextPercent: 42 }, { seq: 2, ts: 1_700_000_100_001 }));
+  assert.equal(state.instances[KEY]?.status, "busy", "the producer's own word comes back, not a guess of ours");
+  assert.equal(state.instances[KEY]?.contextPercent, 42);
+  assert.equal(state.instances[KEY]?.reportedStatus, undefined, "nothing is left over once the label is the producer's again");
+
+  // A producer that does report its status still wins outright.
+  state = markStale(state, 1_700_000_200_000, 100);
+  state = reduceTelemetry(state, event("instance.heartbeat", { status: "waiting" }, { seq: 3, ts: 1_700_000_200_001 }));
+  assert.equal(state.instances[KEY]?.status, "waiting");
+
+  // And a stream this consumer never guessed about is untouched by any of it.
+  const stopped = reduceTelemetry(state, event("instance.stopped", { reason: "exit" }, { seq: 4, ts: 1_700_000_200_002 }));
+  assert.equal(stopped.instances[KEY]?.status, "stopped");
+});

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { parseTelemetryEvent, type TelemetryEvent } from "../../shared/protocol";
-import { createGraphState, entityKey, reduceTelemetry, type GraphState } from "../../src/reducer";
+import { createGraphState, entityKey, fallbackInstance, reduceTelemetry, type AgentView, type GraphState, type InstanceView } from "../../src/reducer";
 
 export type ConnectionState = "connecting" | "live" | "offline";
 export type Attention = "all" | "attention";
@@ -128,7 +128,30 @@ export interface TimelineView {
   graph: GraphState;
 }
 
-interface ReplayCache { log: readonly TelemetryEvent[]; end: number; graph: GraphState }
+interface ReplayCache { log: readonly TelemetryEvent[]; end: number; graph: GraphState; checkpoints: GraphState[] }
+
+/** Events per replay checkpoint. The retained log is capped at MAX_EVENTS (5 000), so this keeps at
+ *  most ~20 snapshots — and reductions are persistent, so the snapshots share almost all their
+ *  structure. It bounds the worst backwards seek to one block instead of the whole log. */
+const REPLAY_CHECKPOINT = 250;
+
+/** Fold `[from, to]` onto `base`, recording a checkpoint at every block boundary it crosses. */
+function foldCheckpointed(
+  graph: GraphState,
+  events: readonly TelemetryEvent[],
+  from: number,
+  to: number,
+  checkpoints: GraphState[],
+): GraphState {
+  let index = Math.max(0, from);
+  while (index <= to) {
+    const stop = Math.min(to, (Math.floor(index / REPLAY_CHECKPOINT) + 1) * REPLAY_CHECKPOINT - 1);
+    graph = foldEvents(graph, events, index, stop);
+    index = stop + 1;
+    if (index % REPLAY_CHECKPOINT === 0) checkpoints[index / REPLAY_CHECKPOINT] = graph;
+  }
+  return graph;
+}
 
 /** REVIEW replays the log captured when the cursor appeared, not the live one. Reading the live log would
  *  slide the reviewed moment out from under the user, and — because every accepted delta hands us a fresh
@@ -148,10 +171,21 @@ export function useTimelineView(graph: GraphState, cursor: number | undefined): 
     if (cursor === undefined) { replay.current = undefined; return undefined; }
     const end = timelineEnd(log, log.length - events.length + Math.trunc(cursor));
     const cache = replay.current;
-    const resumable = cache !== undefined && cache.log === log && cache.end <= end;
+    const sameLog = cache !== undefined && cache.log === log;
+    // Checkpoint 0 is the empty graph, so a backwards seek always has SOMETHING to resume from.
+    const checkpoints = sameLog ? cache.checkpoints : [createGraphState()];
+    // Resuming only forwards was the bug: a leftward slider drag fires one onChange per step, and each
+    // one re-reduced the whole retained window synchronously during render. Seeking back now costs one
+    // checkpoint block, not the entire log.
+    const resumeFrom = sameLog && cache.end <= end
+      ? { graph: cache.graph, from: cache.end + 1 }
+      : (() => {
+          const block = Math.min(Math.max(0, Math.floor(end / REPLAY_CHECKPOINT)), checkpoints.length - 1);
+          return { graph: checkpoints[block]!, from: block * REPLAY_CHECKPOINT };
+        })();
     const next: ReplayCache = {
-      log, end,
-      graph: resumable ? foldEvents(cache.graph, log, cache.end + 1, end) : foldEvents(createGraphState(), log, 0, end),
+      log, end, checkpoints,
+      graph: foldCheckpointed(resumeFrom.graph, log, resumeFrom.from, end, checkpoints),
     };
     replay.current = next;
     return next.graph;
@@ -232,11 +266,39 @@ export function attentionGraph(graph: GraphState): GraphState {
 }
 
 /**
+ * Re-root survivors whose parent did not survive.
+ *
+ * `computeLayout` reaches agents only by walking DOWN from the roots, so an agent whose `parentKey`
+ * no longer resolves is never visited: it, its whole subtree and its tool chips vanish from the
+ * canvas while the rail still counts them, and REVIEW — which does not filter — disagrees with LIVE
+ * about the same graph. The reducer calls a dangling `parentKey` "the actual defect" and repairs it
+ * (`reroot` in src/reducer.ts); every view that prunes agents owes the same repair. One pass is
+ * enough: a survivor's parent either survived, or it is re-rooted here and its own children still
+ * point at a key that is present.
+ */
+function rerootOrphans(agents: Record<string, AgentView>): Record<string, AgentView> {
+  let repaired: Record<string, AgentView> | undefined;
+  for (const [key, agent] of Object.entries(agents)) {
+    if (agent.parentKey === undefined || agents[agent.parentKey]) continue;
+    repaired ??= { ...agents };
+    const { parentKey: _orphaned, ...rest } = agent;
+    repaired[key] = rest as AgentView;
+  }
+  return repaired ?? agents;
+}
+
+/**
  * LIVE canvas: a closed Pi stays in the JSONL log (REVIEW can still scrub it) but it is not
  * presence. Without this, every prior `--exocom` session in the workspace reappears as a card.
  */
 export function livePresence(graph: GraphState): GraphState {
-  const instanceEntries = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
+  const described = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
+  // Nothing in the contract obliges a producer to emit instance.* — the reducer bounds its per-stream
+  // maps against its own registry for exactly that reason — but every card on the canvas is drawn from
+  // `instances`. A stream that reports agents or tool calls without ever describing itself used to be
+  // filtered out here and land on "Awaiting Pi telemetry": a blank canvas rather than a degraded one.
+  // Give it the same minimal card the reducer mints when an event names a stream it has not seen.
+  const instanceEntries = [...described, ...undescribedStreams(graph)];
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
   const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(entityKey(agent.producerId, agent.sessionId))));
   const liveToolOwners = new Set<string>();
@@ -257,7 +319,20 @@ export function livePresence(graph: GraphState): GraphState {
     return !known || liveStream(known.status);
   }));
   const messages = graph.messages.filter((message) => sessions.has(entityKey(message.producerId, message.sessionId)));
-  return { ...graph, instances: Object.fromEntries(instanceEntries), agents, tools, peers, messages };
+  return { ...graph, instances: Object.fromEntries(instanceEntries), agents: rerootOrphans(agents), tools, peers, messages };
+}
+
+/** Streams the graph has work for but no instance view of, as the entries `instances` is missing. */
+function undescribedStreams(graph: GraphState): Array<[string, InstanceView]> {
+  const minted = new Map<string, InstanceView>();
+  const consider = (producerId: string, sessionId: string, ts: number): void => {
+    const key = entityKey(producerId, sessionId);
+    if (graph.instances[key] || minted.has(key)) return;
+    minted.set(key, fallbackInstance(producerId, sessionId, ts));
+  };
+  for (const agent of Object.values(graph.agents)) consider(agent.producerId, agent.sessionId, agent.startedAt);
+  for (const tool of Object.values(graph.tools)) consider(tool.producerId, tool.sessionId, tool.startedAt);
+  return [...minted];
 }
 
 /** Instance/persona/channel scope for the canvas. Exocom is not a workspace-wide leak: a message
@@ -273,7 +348,22 @@ export function filterGraph(graph: GraphState, filters: Filters): GraphState {
     if (filters.channel !== "all" && message.channel !== filters.channel) return false;
     return sessions.has(entityKey(message.producerId, message.sessionId));
   });
-  return { ...graph, instances: Object.fromEntries(instanceEntries), agents, tools, peers, messages };
+  return { ...graph, instances: Object.fromEntries(instanceEntries), agents: rerootOrphans(agents), tools, peers, messages };
+}
+
+/**
+ * Drop a scope selection whose option is no longer on offer.
+ *
+ * A controlled `<select>` with no matching option displays row 0 — "All instances" — while the filter
+ * still holds the key of the instance that went away. `filterGraph` then matches nothing: an empty
+ * canvas the user cannot clear, because re-picking the row the browser already shows fires no change
+ * event. Reconciling the state with the list is what the user is already looking at.
+ */
+export function reconcileFilters(filters: Filters, instances: Record<string, unknown>, personas: readonly string[]): Filters {
+  const staleInstance = filters.instance !== "" && instances[filters.instance] === undefined;
+  const stalePersona = filters.persona !== "" && !personas.includes(filters.persona);
+  if (!staleInstance && !stalePersona) return filters;
+  return { ...filters, instance: staleInstance ? "" : filters.instance, persona: stalePersona ? "" : filters.persona };
 }
 
 export function useFilteredGraph(graph: GraphState, filters: Filters): GraphState {
