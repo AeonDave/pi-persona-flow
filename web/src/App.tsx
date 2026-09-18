@@ -118,13 +118,16 @@ export function formatElapsed(ms: number): string {
   return rest ? `${hours}h ${rest}m` : `${hours}h`;
 }
 
-function summaryLine(model: string | undefined, stats: { total: number; failed: number; running: number }): string {
+function summaryLine(model: string | undefined, stats: { total: number; failed: number; running: number }, exocomEnabled = false): string {
   const parts: string[] = [];
   const named = modelLabel(model);
   if (named) parts.push(named);
   if (stats.failed) parts.push(`${stats.failed} failed`);
   if (stats.running) parts.push(`${stats.running} live`);
   else if (!stats.failed && stats.total) parts.push(`${stats.total} tools`);
+  // The producer tells us whether this instance joined the peer plane. Without it the canvas
+  // only reveals Exocom once traffic happens, so an idle-but-joined instance looked isolated.
+  if (exocomEnabled) parts.push("exocom");
   return parts.join(" · ");
 }
 
@@ -264,7 +267,7 @@ export function computeLayout(graph: GraphState, width: number, height: number):
       entity: { type: "instance", key: sessionId }, streamKey: sessionId, color: statusColor(instance.status),
       label: instance.displayName, status: instance.status,
       span: formatElapsed(instance.updatedAt - instance.startedAt),
-      detail: summaryLine(instance.model, instanceStats),
+      detail: summaryLine(instance.model, instanceStats, instance.exocomEnabled),
       contextPercent: instance.contextPercent,
     };
     rects.push(root);

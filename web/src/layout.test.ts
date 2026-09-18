@@ -293,6 +293,8 @@ describe("control-room layout", () => {
     expect(chips[0]?.label).toBe("read");
     expect(root && chips[0] && chips[0].y >= root.y && chips[0].y + chips[0].height <= root.y + root.height).toBe(true);
     expect(root?.detail).toContain("kimi-k3");
+    // exocomEnabled was parsed but never shown; an idle-but-joined instance looked isolated.
+    expect(root?.detail).toContain("exocom");
     expect(root?.contextPercent).toBe(6);
     expect(toolOwnerKey(Object.values(graph.tools)[0]!, new Set())).toBe("pi-persona::alpha");
     expect(toolsForSelection(graph, { type: "instance", key: "pi-persona::alpha" }).map((tool) => tool.callId)).toEqual(["tc-main"]);
