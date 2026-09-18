@@ -1,6 +1,6 @@
 {
   "name": "pi-persona-flow",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "type": "module",
   "description": "Local real-time dashboard for generic Pi plugin lifecycle telemetry, with rich pi-persona orchestration views.",
