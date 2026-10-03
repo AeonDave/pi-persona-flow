@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { Timeline } from "./App";
 import { reconcileFilters, type Filters } from "./state";
@@ -13,14 +13,14 @@ const event = (seq: number): TelemetryEvent => ({
   sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type: "instance.heartbeat", payload: { contextPercent: seq },
 } as unknown as TelemetryEvent);
 
-interface Harness { host: HTMLElement; root: Root; onCursor: ReturnType<typeof vi.fn>; onPlay: ReturnType<typeof vi.fn> }
+interface Harness { host: HTMLElement; root: Root; onCursor: Mock<(value: number | undefined) => void>; onPlay: Mock<() => void> }
 let live: Harness | undefined;
 
 function show(events: readonly TelemetryEvent[], cursor: number | undefined, playing = false): Harness {
   const harness = live ?? (() => {
     const host = document.createElement("div");
     document.body.append(host);
-    return { host, root: createRoot(host), onCursor: vi.fn(), onPlay: vi.fn() };
+    return { host, root: createRoot(host), onCursor: vi.fn<(value: number | undefined) => void>(), onPlay: vi.fn<() => void>() };
   })();
   live = harness;
   act(() => { harness.root.render(createElement(Timeline, { events, playing, cursor, onCursor: harness.onCursor, onPlay: harness.onPlay })); });

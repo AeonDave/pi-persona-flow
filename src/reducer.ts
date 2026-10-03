@@ -471,6 +471,24 @@ export function reduceTelemetry(state: GraphState, event: TelemetryEvent): Graph
     events: [...previous.events, event].slice(-MAX_EVENTS),
   };
 
+  // Agent/tool telemetry is proof of life too. Producers need not emit instance.* at all, so keep the
+  // stream card and its liveness clock alongside the work it reports. A later work frame also retracts
+  // this consumer's stale guess without changing the agent/tool's own status.
+  const reportsWork = event.type === "agent.added" || event.type === "agent.updated" || event.type === "agent.removed" || event.type === "agent.cleared" || event.type === "tool.started" || event.type === "tool.finished";
+  if (reportsWork) {
+    const current = previous.instances[sequenceKey];
+    if (!current) {
+      next.instances = { ...previous.instances, [sequenceKey]: fallbackInstance(producerId, event.sessionId, event.ts) };
+    } else if (current.status !== "stopped") {
+      const activity: InstanceView = { ...current, updatedAt: event.ts };
+      if (current.status === "stale") {
+        activity.status = current.reportedStatus ?? "running";
+        delete activity.reportedStatus;
+      }
+      next.instances = { ...previous.instances, [sequenceKey]: activity };
+    }
+  }
+
   if (event.seq > seen + 1) {
     next.gaps = {
       ...previous.gaps,

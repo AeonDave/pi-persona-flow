@@ -340,14 +340,13 @@ describe("live presence", () => {
     expect(graph.agents["pi-persona::alpha::child"]?.parentKey).toBe("pi-persona::alpha::parent");
   });
 
-  it("mints a card for a stream that reports work but never describes itself", () => {
-    // Nothing in the contract obliges a producer to emit instance.* — the reducer bounds its per-stream
-    // maps against its own registry for exactly that reason — but every card is drawn from `instances`,
-    // so such a stream used to render as "Awaiting Pi telemetry": blank, not degraded.
+  it("mints and keeps a liveness card for a stream that reports work but never describes itself", () => {
+    // Nothing in the contract obliges a producer to emit instance.*. Work telemetry still creates the
+    // minimal stream card, so the EventStore can age the stream out instead of leaving a live ghost.
     let graph = createGraphState();
     graph = reduceTelemetry(graph, { ...v2("solo", 1, "agent.added", { id: "run", label: "run", kind: "subagent", status: "running" }), producerId: "other-plugin" } as TelemetryEvent);
     graph = reduceTelemetry(graph, { ...v2("solo", 2, "tool.started", { callId: "tc", agentId: "run", name: "read", status: "running" }), producerId: "other-plugin" } as TelemetryEvent);
-    expect(Object.keys(graph.instances)).toEqual([]);
+    expect(Object.keys(graph.instances)).toEqual(["other-plugin::solo"]);
 
     const live = livePresence(graph);
     expect(Object.keys(live.instances)).toEqual(["other-plugin::solo"]);

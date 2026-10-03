@@ -1,153 +1,179 @@
 <h1 align="center">pi-persona-flow</h1>
 
 <p align="center">
-  A local, real-time <b>control room</b> for Pi plugin lifecycle telemetry —
-  instances, delegated agents, tools, and live
-  <code>intercom</code> / <code>exocom</code> traffic, on a token-gated loopback dashboard.
+  A local control room for Pi instances, workers, tools and message traffic.
 </p>
 
-A Pi extension that watches the workspace telemetry log and draws what compatible plugins are
-actually doing: every reporting Pi, nested orchestration, tool lifecycle, and directional message
-traffic. [pi-persona](https://github.com/AeonDave/pi-persona) is the current rich producer, not a
-hard-coded contract owner. Edges animate only while a send is still `queued`; delivered history
-stays still, and the animation is disabled when the OS requests reduced motion. Lifecycle truth is
-emitted by the producer — this dashboard never infers orchestration from tool-result text.
+See what reporting Pi sessions are doing, live or in replay. Flow reads lifecycle telemetry
+and draws the topology; it does not infer progress from an agent's prose.
 
-> Flow is a viewer, not a producer. Install [pi-persona](https://github.com/AeonDave/pi-persona)
-> for the complete intercom/exocom/orchestration view available today, or use any plugin that emits
-> the vendor-neutral `pi:telemetry` v2 contract. Flow does not import or special-case pi-persona.
->
-> Optional sibling: [pi-persona-mind](https://github.com/AeonDave/pi-persona-mind) (durable memory).
-> Flow does not depend on it.
+[pi-persona](https://github.com/AeonDave/pi-persona) is the current rich producer. Flow also
+works with any plugin emitting the vendor-neutral `pi:telemetry` v2 contract. It has no hard
+dependency on pi-persona or [pi-persona-mind](https://github.com/AeonDave/pi-persona-mind).
 
 ## Install
 
-```bash
-# Current full-featured producer (optional if another plugin emits pi:telemetry v2)
-pi install git:github.com/AeonDave/pi-persona
+Requires **Pi 1.0.0+** and **Node.js 22.19.0+**. Windows, Linux and macOS are supported.
 
-# This dashboard
+```bash
+# Full-featured producer; optional if another plugin emits compatible telemetry
+pi install npm:@aeondave/pi-persona
+
+# Dashboard
 pi install git:github.com/AeonDave/pi-persona-flow
 ```
 
-Restart Pi or `/reload`. Then, in any one session of the workspace:
+Restart Pi or run `/reload`, then:
 
 ```text
 /dashboard
 ```
 
-That starts the loopback server and opens a URL containing a random, case-sensitive four-character
-Base62 launch code, for example `?token=Ab0T`. Do not type
-`http://127.0.0.1:7874` by hand — the page loads, `/api/snapshot` returns 401, and the room stays
-empty. Use `/dashboard status` to copy the link if the browser did not open.
+This starts the loopback server and opens its authenticated URL. The git install includes
+the compiled web UI; users do not need to run Vite.
+
+## Commands
 
 ```text
-/dashboard         start the server and open the dashboard
+/dashboard         start and open the dashboard
 /dashboard open    open the running dashboard
-/dashboard status  show its URL and current summary
-/dashboard stop    stop it
+/dashboard serve   start without opening a browser
+/dashboard status  show the current authenticated URL
+/dashboard stop    stop the server, including a pending start
 ```
 
-Autostart:
+Autostart with `pi --flow`. To set it through the environment:
 
 ```bash
-pi --flow
-# or
+# Linux / macOS
 PI_PERSONA_FLOW_AUTOSTART=1 pi
 ```
 
-On start, Pi shows a persistent line you can click:
-
-```text
-flow dashboard at http://127.0.0.1:7874/?token=…
+```powershell
+# Windows PowerShell
+$env:PI_PERSONA_FLOW_AUTOSTART = "1"
+pi
 ```
 
-The footer also names `127.0.0.1:<port>`. Do not type the port by itself — without the token the page loads and then sits empty on a 401. `/dashboard status` reprints the same link; `/dashboard` opens it in the browser.
+Pi keeps a clickable line above the editor:
 
-Default port is `7874` (`PI_PERSONA_FLOW_PORT` to override). If that port is taken, the extension
-binds an OS-assigned loopback port instead — which is why the announced URL matters.
+```text
+flow dashboard at http://127.0.0.1:7874/?token=Ab0T
+```
 
-Run the dashboard in **one** session. It tails every producer's log for that workspace; the other
-sessions need nothing extra. All sessions must share the same working directory — the workspace id
-is the path.
+Use that link, or `/dashboard status`. A bare `http://127.0.0.1:7874` loads the page but
+cannot authenticate the API. The launch code is random, case-sensitive and changes whenever
+the server restarts.
+
+Default port: `7874`; set `PI_PERSONA_FLOW_PORT` to override it (`0` asks the OS for a port).
+If the requested port is occupied, Flow chooses an available loopback port and announces it.
+Concurrent starts share one listener, and stopping cannot leave a late-started server behind.
+
+Run Flow in **one session per workspace**. It tails every producer's workspace log; other
+sessions need no dashboard of their own. Producers must use the same canonical workspace
+and agent directory for file-backed aggregation.
 
 ## What you see
 
-- every reporting Pi/plugin instance: persona, model, context pressure, status;
-- nested agents (delegates, council, flow phases) and their tools;
-- **intercom** — supervisor ↔ child, inside one pi-persona run;
-- **exocom** — flat traffic between independent Pi instances in the same workspace;
-- a bounded, replayable event timeline and a selected-node inspector;
-- click or keyboard-selectable cards with producer/session identity, derived live status, tool
-  history, and safe traffic metadata (direction, channel, size, reply linkage, and time).
+- Reporting Pi/plugin instances: display name, persona/model when supplied, context pressure
+  and liveness.
+- Nested workers, councils and flow phases, with their tool calls.
+- Intercom traffic within one supervisor's run and exocom traffic between independent sessions.
+- A bounded event timeline with live view and replay.
+- A selected-node inspector with tool history and safe traffic metadata: direction, channel,
+  size, reply linkage and time.
 
-Selecting one instance scopes the canvas to **that stream's** messages and the peers it observed.
-Exocom from other instances does not leak through. Channel lines move only while telemetry says
-the send is still in flight (`queued`).
+Names and aliases are shown when telemetry identifies the endpoint exactly. Raw routing IDs
+remain available in the route's tooltip. Unknown engine handles stay raw: a matching bare
+agent name is not enough to identify an older run safely.
+
+`waiting` means the **producer explicitly reports a pending supervisor reply**. Flow does
+not mistake an old ask for a stalled worker or infer waiting from tool output. A producer
+that omits the status cannot supply that distinction.
+
+When a stream stops reporting, LIVE view hides its stale card, including producers that
+emit only agent/tool events. Its recorded work stays intact for REVIEW; fresh activity
+restores liveness. Instance and agent status are separate: loss of a heartbeat does not
+rewrite a running agent as failed.
+
+Selecting an instance scopes traffic to that stream and the peers it observed. Exocom from
+unrelated instances does not leak through. Traffic animates only while a send is `queued`;
+delivered history stays still. Reduced motion disables the animation, and an idle canvas
+does not run a continuous animation loop.
 
 ## Local development
-
-The git install already includes `dist/web`. From a source checkout:
 
 ```bash
 npm ci
 npm --prefix web ci
-npm run build
-npm run test:all
 npm run typecheck:all
+npm run test:all
+npm run build
+npm audit --audit-level=low
+npm --prefix web audit --audit-level=low
 pi -e ./src/extension.ts
 ```
+
+Rebuild after web changes: `dist/web` is shipped with the package. Tests include an isolated
+**real Pi 1.0 SDK session**, authenticated HTTP access, start/stop races, stale-stream
+recovery and web interaction regressions. CI runs on Windows, Ubuntu and macOS.
+
+For browser acceptance, run `node --import tsx test-results/serve-fixture.mts`, open its printed
+URL with Playwright CLI, then run `playwright-cli run-code --filename=scripts/browser-acceptance.cjs`.
+It checks waiting/aliases, traffic, replay, safe payload projection and idle animation. The fixture
+closes itself after ten minutes.
+
+After packing and extracting into a temporary directory, run
+`node --import tsx scripts/qualify-package.ts <package>/src/extension.ts` from this checkout to
+verify the host loader, shipped web assets and shutdown independently of source-tree resolution.
 
 ## Architecture
 
 ```text
-Any compatible Pi plugin (pi-persona is the current rich producer)
-  ├─ pi.events: pi:telemetry (+ legacy v1) ─ immediate local delivery
-  └─ JSONL  <agent-dir>/telemetry/v2/<workspace>/<producer>/<session>.jsonl
-                                         │
-                                         ▼
-TelemetryTailer ──► EventStore ──► deterministic graph reducer
-                         │
-                         ├─ GET /api/snapshot  { cursor, state }
-                         └─ GET /api/stream    cursor-based SSE
-                                         │
-                                         ▼
-React controls + Canvas topology + timeline replay
+Compatible Pi plugins
+  +-- pi.events: pi:telemetry -- immediate local delivery
+  +-- JSONL: <agent-dir>/telemetry/v2/<workspace>/<producer>/<session>.jsonl
+                                  |
+                         TelemetryTailer
+                                  |
+                             EventStore
+                                  |
+                      deterministic graph reducer
+                                  |
+             loopback snapshot API + cursor-based SSE
+                                  |
+                  React controls, Canvas and replay
 ```
 
-The contract is version `2` on `pi:telemetry`. Legacy v1 (`pi-persona:telemetry`) files are still
-read. Identity, sequence, and entity scope are `(producerId, sessionId)`. Producers must emit
-bounded semantic metadata only — never model output, prompts, tool arguments, paths, secrets, or
-message bodies. Unknown namespaced envelopes stay observable; their unregistered payload is `{}`.
+The wire contract is version `2`. Legacy v1 `pi-persona:telemetry` files remain readable;
+this is data compatibility, not support for pre-1.0 Pi hosts. Stream identity is
+`(producerId, sessionId)`, so different plugins can reuse session IDs without collisions.
+
+Producers emit bounded semantic metadata, never prompts, model output, tool arguments,
+paths, secrets or message bodies. Unknown namespaced events retain the envelope but project
+their unregistered payload to `{}`.
 
 Key files:
 
-- `shared/protocol.ts` — versioned envelope and parser;
-- `src/tailer.ts` — namespaced JSONL ingestion;
-- `src/event-store.ts` — dedupe, cursor, bounded replay;
-- `src/reducer.ts` — instances, agents, tools, messages, peers;
-- `src/server.ts` — authenticated loopback static/API/SSE server;
-- `src/extension.ts` — `/dashboard`, `--flow`, live event-bus;
-- `web/` — React/Vite dashboard (production output `dist/web`).
+- `shared/protocol.ts`: wire vocabulary and parser.
+- `src/tailer.ts`: appended JSONL ingestion.
+- `src/event-store.ts` and `src/reducer.ts`: dedupe, bounded replay and graph state.
+- `src/server.ts`: loopback static/API/SSE server.
+- `src/extension.ts`: commands, lifecycle and live event bus.
+- `web/`: React/Vite UI; production output in `dist/web`.
 
 ## Security
 
-- binds only to `127.0.0.1`;
-- a random four-character Base62 launch code gates API and SSE and is minted per server start;
-- the landing page also drops the same code as an `HttpOnly` cookie named for the port it is serving,
-  because a cookie is scoped by host and never by port; any credential the request presents may
-  authorize it, so a stale or planted cookie cannot 401 a dashboard whose URL carries the right code;
-- arbitrary `Host` headers are rejected to prevent DNS-rebinding access;
-- concurrent SSE clients are capped, and one that stops reading is dropped rather than buffered inside
-  the host agent;
-- same-origin static assets, CSP, no wildcard CORS, no external fonts;
-- tails only appended file bytes and bounds unterminated lines;
-- deduplicates live-bus and JSONL copies by producer/session/event identity;
-- caps retained events, messages, and completed stream projections;
-- marks instances stale when heartbeats stop and un-marks them when one arrives; LIVE topology hides stopped/stale Pi so a closed `--exocom` session does not linger as a card (REVIEW still scrubs the log);
-- Windows `/dashboard` opens via `rundll32` (never `cmd /c start`).
+The server binds only to `127.0.0.1`. A four-character Base62 launch code gates API and SSE;
+a port-specific `HttpOnly` cookie keeps the browser connected. Arbitrary Host headers are
+rejected; assets are same-origin, with CSP and no wildcard CORS or external fonts.
 
-The short code is intentionally a human-readable convenience gate for a read-only service bound to
-loopback, not strong authentication (four Base62 characters provide about 23.8 bits). Other local
-processes running as the same user should be treated as trusted; do not expose or proxy this server
-off-host.
+Concurrent SSE clients and slow-reader buffers are bounded. File ingestion bounds unfinished
+lines, deduplicates bus/file copies, and caps retained events, messages and stream projections.
+Windows browser launch uses `rundll32`, not `cmd /c start`.
+
+The short code is a convenience gate for a **read-only local service**, not strong
+authentication. Treat other processes running as your user as trusted. Do not expose or proxy
+the dashboard off-host.
+
+[Changes](CHANGELOG.md) · [MIT license](LICENSE)

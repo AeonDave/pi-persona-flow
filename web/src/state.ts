@@ -293,11 +293,8 @@ function rerootOrphans(agents: Record<string, AgentView>): Record<string, AgentV
  */
 export function livePresence(graph: GraphState): GraphState {
   const described = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status));
-  // Nothing in the contract obliges a producer to emit instance.* — the reducer bounds its per-stream
-  // maps against its own registry for exactly that reason — but every card on the canvas is drawn from
-  // `instances`. A stream that reports agents or tool calls without ever describing itself used to be
-  // filtered out here and land on "Awaiting Pi telemetry": a blank canvas rather than a degraded one.
-  // Give it the same minimal card the reducer mints when an event names a stream it has not seen.
+  // Nothing in the contract obliges a producer to emit instance.*. The reducer mints a minimal stream
+  // card on the first event, so its stale clock and this LIVE filter apply equally to every producer.
   const instanceEntries = [...described, ...undescribedStreams(graph)];
   const sessions = new Set(instanceEntries.map(([sessionId]) => sessionId));
   const roster = Object.fromEntries(Object.entries(graph.agents).filter(([, agent]) => sessions.has(entityKey(agent.producerId, agent.sessionId))));
@@ -322,7 +319,7 @@ export function livePresence(graph: GraphState): GraphState {
   return { ...graph, instances: Object.fromEntries(instanceEntries), agents: rerootOrphans(agents), tools, peers, messages };
 }
 
-/** Streams the graph has work for but no instance view of, as the entries `instances` is missing. */
+/** Compatibility fallback for graphs restored from older snapshots without a stream card. */
 function undescribedStreams(graph: GraphState): Array<[string, InstanceView]> {
   const minted = new Map<string, InstanceView>();
   const consider = (producerId: string, sessionId: string, ts: number): void => {

@@ -50,16 +50,47 @@ export function messagesForSelection(messages: readonly MessageView[], selected:
   }).slice(-5).reverse();
 }
 
+function messageEndpointAgent(message: MessageView, endpoint: string, graph: GraphState): AgentView | undefined {
+  if (message.channel !== "intercom") return undefined;
+  // An engine handle such as scout#7 is NOT a tree ID. Even one matching bare agent name
+  // could be a later run, so never attribute historical traffic by name or sequence guesses.
+  return graph.agents[entityKey(message.producerId, message.sessionId, endpoint)];
+}
+
 /** Describe traffic relative to the selected node. Instance-level intercom is an internal exchange,
  *  while an exact endpoint match has a useful inbound/outbound direction. */
-export function messageRoute(message: MessageView, selected: EntityId): string {
-  if (selected.type === "instance" && message.channel === "intercom") return `${message.from} → ${message.to}`;
-  if (message.fromKey === selected.key && message.toKey !== selected.key) return `OUT → ${message.to}`;
-  if (message.toKey === selected.key && message.fromKey !== selected.key) return `IN ← ${message.from}`;
-  if (selected.type === "instance" && entityKey(message.producerId, message.sessionId) === selected.key) {
-    if (message.from === message.sessionId && message.to !== message.sessionId) return `OUT → ${message.to}`;
-    if (message.to === message.sessionId && message.from !== message.sessionId) return `IN ← ${message.from}`;
+function messageEndpointLabel(message: MessageView, endpoint: string, graph: GraphState): string {
+  const instance = graph.instances[entityKey(message.producerId, message.sessionId)];
+  if (endpoint === "supervisor" || endpoint === message.sessionId) return instance?.displayName || endpoint;
+  const agent = messageEndpointAgent(message, endpoint, graph);
+  if (agent) return agent.label || endpoint;
+  if (message.channel === "exocom") {
+    const peer = graph.peers[entityKey(message.producerId, message.sessionId, endpoint)];
+    if (peer) return peer.displayName || endpoint;
+    const remote = graph.instances[entityKey(message.producerId, endpoint)];
+    if (remote) return remote.displayName || endpoint;
   }
+  return endpoint;
+}
+
+/** Keep raw telemetry endpoints on the message; this route is only their human-readable presentation. */
+export function messageRoute(message: MessageView, selected: EntityId, graph: GraphState): string {
+  const from = messageEndpointLabel(message, message.from, graph);
+  const to = messageEndpointLabel(message, message.to, graph);
+  const fromAgent = messageEndpointAgent(message, message.from, graph);
+  const toAgent = messageEndpointAgent(message, message.to, graph);
+  if (selected.type === "instance" && message.channel === "intercom") return `${from} → ${to}`;
+  if ((message.fromKey === selected.key || fromAgent?.key === selected.key) && message.toKey !== selected.key) return `OUT → ${to}`;
+  if ((message.toKey === selected.key || toAgent?.key === selected.key) && message.fromKey !== selected.key) return `IN ← ${from}`;
+  if (selected.type === "instance" && entityKey(message.producerId, message.sessionId) === selected.key) {
+    if (message.from === message.sessionId && message.to !== message.sessionId) return `OUT → ${to}`;
+    if (message.to === message.sessionId && message.from !== message.sessionId) return `IN ← ${from}`;
+  }
+  return `${from} → ${to}`;
+}
+
+/** Raw IDs stay available for diagnosing routes even when the inspector shows display labels. */
+export function messageRouteIds(message: MessageView): string {
   return `${message.from} → ${message.to}`;
 }
 
@@ -515,7 +546,7 @@ function Inspector({ graph, selected, onClose, onSelect }: { graph: GraphState; 
         <div><dt>AGENT</dt><dd><button type="button" className="linkish" onClick={() => onSelect(toolAgent ? { type: "agent", key: tool.agentKey } : { type: "instance", key: toolInstanceKey })}>{toolAgent?.label ?? graph.instances[toolInstanceKey]?.displayName ?? tool.agentId}</button></dd></div>
       </dl>}
       {(instance || agent || tool) && <ToolCalls tools={relatedTools} selected={selected} onSelect={onSelect} />}
-      <div className="inspector-section"><span className="eyebrow">RECENT TRAFFIC</span>{relatedMessages.length ? relatedMessages.map((message) => <div className="traffic-row" key={message.key}><span className={`channel-mark ${message.channel}`} /><span className="traffic-copy"><strong>{message.channel.toUpperCase()} · {message.kind}</strong><span>{messageRoute(message, selected)}</span><em>{message.size} B · {message.replyTo ? `reply to ${short(message.replyTo, 12)}` : message.expectsReply ? "reply expected" : "one-way"}</em></span><span className="traffic-state"><b>{message.status}</b><time title={new Date(message.ts).toISOString()}>{relative(message.ts)}</time></span></div>) : <div className="empty-small">No message frames for this node.</div>}</div>
+      <div className="inspector-section"><span className="eyebrow">RECENT TRAFFIC</span>{relatedMessages.length ? relatedMessages.map((message) => <div className="traffic-row" key={message.key}><span className={`channel-mark ${message.channel}`} /><span className="traffic-copy"><strong>{message.channel.toUpperCase()} · {message.kind}</strong><span title={messageRouteIds(message)}>{messageRoute(message, selected, graph)}</span><em>{message.size} B · {message.replyTo ? `reply to ${short(message.replyTo, 12)}` : message.expectsReply ? "reply expected" : "one-way"}</em></span><span className="traffic-state"><b>{message.status}</b><time title={new Date(message.ts).toISOString()}>{relative(message.ts)}</time></span></div>) : <div className="empty-small">No message frames for this node.</div>}</div>
     </> : <div className="empty-inspector"><CircleDot size={28} /><p>Select an instance, agent, or tool call to inspect live telemetry.</p></div>}
   </aside>;
 }

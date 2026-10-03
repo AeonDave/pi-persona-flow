@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { TelemetryEvent } from "../../shared/protocol";
 import { createGraphState, reduceTelemetry } from "../../src/reducer";
-import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messageRoute, messagesForSelection, modelLabel, rankCanvasTools, shouldAnimateTraffic, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
+import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messageRoute, messageRouteIds, messagesForSelection, modelLabel, rankCanvasTools, shouldAnimateTraffic, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
 import { livePresence } from "./state";
 
 const instance = (seq: number, type: "instance.started" | "agent.added", payload: TelemetryEvent["payload"]): TelemetryEvent => ({
@@ -216,21 +216,50 @@ describe("control-room layout", () => {
   it("the instance inspector lists intercom traffic owned by that stream", () => {
     let graph = createGraphState();
     graph = reduceTelemetry(graph, instance(1, "instance.started", {
-      displayName: "Alpha", persona: "operator", model: "test-model", status: "active", pid: 42, contextPercent: 28, exocomEnabled: true,
+      displayName: "Alpha Operator", persona: "operator", model: "test-model", status: "active", pid: 42, contextPercent: 28, exocomEnabled: true,
     }));
     graph = reduceTelemetry(graph, instance(2, "agent.added", {
-      id: "scout", label: "Scout", kind: "subagent", status: "running", parentId: undefined, task: "inspect",
+      id: "scout-run-1", label: "Scout · async run", kind: "subagent", status: "running", parentId: undefined, task: "inspect",
     }));
     graph = reduceTelemetry(graph, {
       version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "m-ic", seq: 3, ts: 3000,
       sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type: "message.sent",
-      payload: { id: "ask-1", channel: "intercom", from: "supervisor", to: "scout", kind: "ask", status: "queued", expectsReply: true, size: 8 },
+      payload: { id: "ask-1", channel: "intercom", from: "supervisor", to: "scout-run-1", kind: "ask", status: "queued", expectsReply: true, size: 8 },
     } as unknown as TelemetryEvent);
     const traffic = messagesForSelection(graph.messages, { type: "instance", key: "pi-persona::alpha" });
     expect(traffic.map((message) => message.id)).toEqual(["ask-1"]);
+    expect(graph.messages[0]?.from).toBe("supervisor");
+    expect(graph.messages[0]?.to).toBe("scout-run-1");
     expect(graph.messages[0]?.fromKey).toBe("pi-persona::alpha::supervisor");
-    expect(messageRoute(traffic[0]!, { type: "instance", key: "pi-persona::alpha" })).toBe("supervisor → scout");
-    expect(messageRoute(traffic[0]!, { type: "agent", key: "pi-persona::alpha::scout" })).toBe("IN ← supervisor");
+    expect(messageRoute(traffic[0]!, { type: "instance", key: "pi-persona::alpha" }, graph)).toBe("Alpha Operator → Scout · async run");
+    expect(messageRoute(traffic[0]!, { type: "agent", key: "pi-persona::alpha::scout-run-1" }, graph)).toBe("IN ← Alpha Operator");
+    expect(messageRouteIds(traffic[0]!)).toBe("supervisor → scout-run-1");
+  });
+
+  it("never aliases a bus handle by bare agent name, even when only one later run exists", () => {
+    let graph = createGraphState();
+    graph = reduceTelemetry(graph, instance(1, "instance.started", {
+      displayName: "Alpha Operator", persona: "operator", model: "test-model", status: "active", pid: 42, contextPercent: 28, exocomEnabled: true,
+    }));
+    graph = reduceTelemetry(graph, instance(2, "agent.added", {
+      id: "work/scout", label: "Scout · async run", agent: "scout", kind: "subagent", status: "running",
+    }));
+    graph = reduceTelemetry(graph, {
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "m-ask", seq: 3, ts: 3000,
+      sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type: "message.received",
+      payload: { id: "ask-1", channel: "intercom", from: "scout#7", to: "supervisor", kind: "decision", status: "delivered", expectsReply: true, size: 8 },
+    } as unknown as TelemetryEvent);
+
+    const selected = { type: "agent" as const, key: "pi-persona::alpha::work/scout" };
+    expect(messagesForSelection(graph.messages, selected)).toEqual([]);
+    expect(messageRoute(graph.messages[0]!, selected, graph)).toBe("scout#7 → Alpha Operator");
+    expect(messageRouteIds(graph.messages[0]!)).toBe("scout#7 → supervisor");
+
+    graph = reduceTelemetry(graph, instance(4, "agent.added", {
+      id: "work/scout-copy", label: "Other Scout", agent: "scout", kind: "subagent", status: "running",
+    }));
+    expect(messagesForSelection(graph.messages, selected)).toEqual([]);
+    expect(messageRoute(graph.messages[0]!, selected, graph)).toBe("scout#7 → Alpha Operator");
   });
 
   const toolCall = (seq: number, callId: string, agentId: string, name: string, status: "running" | "done" | "failed", durationMs?: number): TelemetryEvent => ({

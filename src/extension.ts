@@ -1,18 +1,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { VERSION } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 
 import { LEGACY_TELEMETRY_EVENT_NAME, TELEMETRY_EVENT_NAME } from "../shared/protocol.ts";
 import { EventStore } from "./event-store.ts";
 import { startServer, type FlowServer } from "./server.ts";
 import { TelemetryTailer, workspaceHash } from "./tailer.ts";
+import { isSupportedPiVersion, MIN_PI_VERSION } from "./pi-compat.ts";
 
 const DEFAULT_PORT = 7874;
 
 /** Pi extension entry point for the file-backed, explicit telemetry dashboard. */
 export default function piPersonaFlow(pi: ExtensionAPI): void {
+  if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-flow requires Pi ${MIN_PI_VERSION}+ (found ${VERSION}).`);
   let store: EventStore | undefined;
   let tailer: TelemetryTailer | undefined;
   let server: FlowServer | undefined;
+  let pendingStart: Promise<FlowServer | undefined> | undefined;
+  let serverGeneration = 0;
   let unsubscribeTelemetry: (() => void) | undefined;
   let unsubscribeStatus: (() => void) | undefined;
   let generation = 0;
@@ -35,28 +40,38 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
 
   async function startIfNeeded(): Promise<FlowServer | undefined> {
     if (server) return server;
+    if (pendingStart) return pendingStart;
     const thisGeneration = generation;
+    const thisServerGeneration = serverGeneration;
     const currentStore = store;
     if (!currentStore) return undefined;
-    let candidate: FlowServer;
-    try {
-      candidate = await startServer({ port, store: currentStore });
-    } catch {
-      candidate = await startServer({ port: 0, store: currentStore });
-    }
-    if (thisGeneration !== generation || store !== currentStore) {
-      await candidate.close();
-      return undefined;
-    }
-    server = candidate;
-    port = candidate.port;
-    return candidate;
+    const opening = (async () => {
+      let candidate: FlowServer;
+      try {
+        candidate = await startServer({ port, store: currentStore });
+      } catch {
+        candidate = await startServer({ port: 0, store: currentStore });
+      }
+      if (thisGeneration !== generation || thisServerGeneration !== serverGeneration || store !== currentStore) {
+        await candidate.close();
+        return undefined;
+      }
+      server = candidate;
+      port = candidate.port;
+      return candidate;
+    })();
+    pendingStart = opening;
+    try { return await opening; }
+    finally { if (pendingStart === opening) pendingStart = undefined; }
   }
 
   async function stopServer(): Promise<void> {
+    serverGeneration += 1;
+    const opening = pendingStart;
+    pendingStart = undefined;
     const current = server;
     server = undefined;
-    if (current) await current.close();
+    await Promise.all([current?.close(), opening?.catch(() => undefined)]);
   }
 
   type SessionUi = {
@@ -68,6 +83,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     };
   };
   let sessionUi: SessionUi | undefined;
+  let lastStatus: string | undefined;
 
   function listeningHostPort(): string | undefined {
     if (!server) return undefined;
@@ -97,7 +113,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
       process.stdout.write(`${line}\n`);
       return;
     }
-    try { sessionUi.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable */ }
+    updateStatus();
     // Widget only — a toast of the same line stacks above the exocom row and duplicates it.
     try { sessionUi.ui.setWidget?.("flow", [line], { placement: "aboveEditor" }); } catch { /* older Pi / RPC */ }
   }
@@ -105,23 +121,32 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
   function hideListening(): void {
     if (!sessionUi?.hasUI) return;
     try { sessionUi.ui.setWidget?.("flow", undefined); } catch { /* older Pi / RPC */ }
-    try { sessionUi.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable */ }
+    updateStatus();
+  }
+
+  function updateStatus(): void {
+    if (!sessionUi?.hasUI) return;
+    const value = statusText();
+    if (value === lastStatus) return;
+    try {
+      sessionUi.ui.setStatus("flow", value);
+      lastStatus = value;
+    } catch { /* Retry on the next event if the UI was unavailable. */ }
   }
 
   pi.on("session_start", async (_event, ctx) => {
     generation += 1;
     const startupGeneration = generation;
-    const previousServer = server;
-    server = undefined;
+    await stopServer();
+    if (generation !== startupGeneration) return;
     sessionUi = ctx;
+    lastStatus = undefined;
     unsubscribeTelemetry?.();
     unsubscribeTelemetry = undefined;
     unsubscribeStatus?.();
     unsubscribeStatus = undefined;
     tailer?.stop();
     tailer = undefined;
-    if (previousServer) await previousServer.close();
-    if (generation !== startupGeneration) return;
     port = resolvePort();
     const currentGeneration = generation;
     const cwd = ctx.cwd;
@@ -142,12 +167,9 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
     }
 
     unsubscribeStatus = nextStore.subscribe(() => {
-      if (!ctx.hasUI) return;
-      try { ctx.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable during teardown */ }
+      updateStatus();
     });
-    if (ctx.hasUI) {
-      try { ctx.ui.setStatus("flow", statusText()); } catch { /* UI may be unavailable during startup */ }
-    }
+    updateStatus();
     if (autostart()) {
       const started = await startIfNeeded();
       if (started && generation === currentGeneration) announceListening(started.url);
@@ -179,12 +201,17 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
 
   // NOT "flow": pi-persona already owns /flow for running a flow (a DAG over strategies). It wins the
   // registration, so "/flow open" resolves to "run a flow named open" and this dashboard becomes
-  // unreachable by command while still serving on its port. This package depends on pi-persona, so
-  // it is the one that yields the name.
+  // unreachable by command while still serving on its port. This companion yields the name;
+  // it can also run standalone with any compatible producer.
   pi.registerCommand("dashboard", {
     description: "Open the live telemetry dashboard",
     handler: async (args, ctx) => {
       const sub = (args ?? "").trim().toLowerCase();
+      if (!["", "open", "serve", "status", "stop"].includes(sub)) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /dashboard [open|serve|status|stop]", "warning");
+        else process.stdout.write("Usage: /dashboard [open|serve|status|stop]\n");
+        return;
+      }
       if (sub === "stop") {
         await stopServer();
         hideListening();
@@ -202,7 +229,7 @@ export default function piPersonaFlow(pi: ExtensionAPI): void {
         if (ctx.hasUI) ctx.ui.notify("pi-persona-flow: no active session.", "error");
         return;
       }
-      if (sub === "" || sub === "open" || sub === "serve") openBrowser(started.url);
+      if (sub === "" || sub === "open") openBrowser(started.url);
       announceListening(started.url);
     },
   });

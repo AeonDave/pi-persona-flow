@@ -31,6 +31,47 @@ test("EventStore assigns a global cursor, deduplicates, reduces, and notifies", 
   assert.deepEqual(store.backlog(0)?.map((d) => d.cursor), [1, 2]);
 });
 
+test("agent/tool-only streams age out, preserve work, and recover on heartbeat", () => {
+  let now = 1_000;
+  const store = new EventStore({ staleAfterMs: 100, now: () => now });
+  const notices: string[] = [];
+  store.subscribe((delta) => notices.push(delta.event.type));
+
+  store.append({
+    ...event(1, "agent-added"), ts: now, type: "agent.added",
+    payload: { id: "run-1", label: "Scout", kind: "subagent", status: "running" },
+  } as unknown as TelemetryEvent);
+  store.append({
+    ...event(2, "tool-started"), ts: now + 1, type: "tool.started",
+    payload: { callId: "tool-1", agentId: "run-1", name: "read", status: "running" },
+  } as unknown as TelemetryEvent);
+
+  let state = store.snapshot().state;
+  assert.equal(state.instances["pi-persona::session"]?.status, "active");
+  assert.equal(state.agents["pi-persona::session::run-1"]?.status, "running");
+  assert.equal(state.tools["pi-persona::session::tool-1"]?.status, "running");
+
+  now += 101;
+  assert.equal(store.sweepStale(), 1);
+  state = store.snapshot().state;
+  assert.equal(state.instances["pi-persona::session"]?.status, "stale");
+  assert.equal(state.agents["pi-persona::session::run-1"]?.status, "running");
+  assert.equal(state.tools["pi-persona::session::tool-1"]?.status, "running");
+  assert.equal(notices.at(-1), "stream.stale");
+
+  now += 1;
+  store.append({ ...event(3, "heartbeat"), ts: now, type: "instance.heartbeat", payload: { contextPercent: 20 } });
+  state = store.snapshot().state;
+  assert.equal(state.instances["pi-persona::session"]?.status, "active");
+  assert.equal(state.agents["pi-persona::session::run-1"]?.status, "running");
+  assert.equal(state.tools["pi-persona::session::tool-1"]?.status, "running");
+
+  now += 99;
+  assert.equal(store.sweepStale(), 0);
+  now += 1;
+  assert.equal(store.sweepStale(), 1);
+});
+
 test("delimiter-bearing stream identities do not share a sequence cursor", () => {
   const store = new EventStore(4);
   const first = { ...event(1, "first:1"), producerId: "plug::in", sessionId: "session" };
