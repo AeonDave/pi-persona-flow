@@ -89,6 +89,6 @@ test("ten default Pi clients share one dashboard despite a port collision", { ti
     }
     assert.equal(dirname(resolve(root)), resolve(tmpdir()));
     assert.ok(root.includes("flow-ten-sessions-"));
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

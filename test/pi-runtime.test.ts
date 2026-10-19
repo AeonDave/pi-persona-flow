@@ -55,7 +55,7 @@ test("real Pi 1.0: autostart, authenticated telemetry API, bounded UI updates an
     await h?.dispose();
     if (previousPort === undefined) delete process.env.PI_PERSONA_FLOW_PORT;
     else process.env.PI_PERSONA_FLOW_PORT = previousPort;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -93,6 +93,6 @@ test("real Pi 1.0: concurrent attachments share one service and stop cancels pen
     await h?.dispose();
     if (previousPort === undefined) delete process.env.PI_PERSONA_FLOW_PORT;
     else process.env.PI_PERSONA_FLOW_PORT = previousPort;
-    await rm(root, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

@@ -23,10 +23,10 @@ pi install npm:@aeondave/pi-persona
 pi install git:github.com/AeonDave/pi-persona-flow
 ```
 
-For the current manual-test candidate, pin the tag instead:
+For a reproducible install of this stable release, pin the tag:
 
 ```bash
-pi install git:github.com/AeonDave/pi-persona-flow@v0.3.0-rc.1
+pi install git:github.com/AeonDave/pi-persona-flow@v0.3.0
 ```
 
 Restart Pi or run `/reload`. Flow attaches to one shared local service automatically,

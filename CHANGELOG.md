@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.3.0](https://github.com/AeonDave/pi-persona-flow/compare/v0.3.0-rc.1...v0.3.0) - 2026-10-19
+
+- Promote the qualified `0.3.0-rc.1` candidate to stable. No production behavior changed; the
+  Windows test fixtures now retry bounded temporary-profile cleanup after service shutdown. The
+  candidate section below retains the complete feature and qualification notes.
+
 ## [0.3.0-rc.1](https://github.com/AeonDave/pi-persona-flow/compare/v0.2.0...v0.3.0-rc.1) - 2026-10-19
 
 Candidate for maintainer testing; GitHub release publication is deferred until manual acceptance.
