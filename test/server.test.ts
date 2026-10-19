@@ -1,13 +1,22 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 
 import { EventStore } from "../src/event-store.ts";
-import { startServer } from "../src/server.ts";
+import { startServer, type FlowServer, type FlowServerOptions } from "../src/server.ts";
 import { TELEMETRY_VERSION, type TelemetryEvent } from "../shared/protocol.ts";
+import { createFixtureScope } from "./setup/fixture-scope.ts";
+
+const fixtures = createFixtureScope();
+after(() => fixtures.cleanup());
+
+async function startTrackedServer(options: FlowServerOptions): Promise<FlowServer> {
+  const server = await startServer(options);
+  fixtures.trackHandle(() => server.close());
+  return server;
+}
 
 function event(seq: number): TelemetryEvent {
   return {
@@ -26,9 +35,9 @@ function event(seq: number): TelemetryEvent {
 
 async function withServer(fn: (url: string, token: string, store: EventStore) => Promise<void>): Promise<void> {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-"));
+  const staticDir = fixtures.tempDirectory("flow-web-");
   writeFileSync(join(staticDir, "index.html"), "<!doctype html><title>flow</title>");
-  const server = await startServer({ port: 0, store, staticDir });
+  const server = await startTrackedServer({ port: 0, store, staticDir });
   try { await fn(`http://127.0.0.1:${server.port}`, server.token, store); }
   finally { await server.close(); }
 }
@@ -42,6 +51,23 @@ test("API requires the per-server token and exposes security headers without COR
     assert.equal(response.headers.get("access-control-allow-origin"), null);
     assert.match(response.headers.get("content-security-policy") ?? "", /default-src/);
     assert.equal((await response.json() as { cursor: number }).cursor, 0);
+  });
+});
+
+test("the legacy single-store server exposes a local workspace adapter", async () => {
+  await withServer(async (url, token) => {
+    const catalogResponse = await fetch(`${url}/api/workspaces?token=${token}`);
+    assert.equal(catalogResponse.status, 200);
+    const catalog = await catalogResponse.json() as { workspaces: Array<{ id: string; label: string; activeSessions: number; lastSeenAt: number }>; defaultWorkspaceId?: string };
+    assert.equal(catalog.defaultWorkspaceId, "local");
+    assert.deepEqual(catalog.workspaces.map(({ id, label, activeSessions }) => ({ id, label, activeSessions })), [
+      { id: "local", label: "local", activeSessions: 0 },
+    ]);
+    assert.equal(catalog.workspaces[0]?.lastSeenAt, 0, "the legacy adapter has no attachment activity to report");
+    const explicitUnknown = await fetch(`${url}/api/snapshot?workspace=elsewhere&token=${token}`);
+    assert.equal(explicitUnknown.status, 404);
+    const localSnapshot = await fetch(`${url}/api/snapshot?workspace=local&token=${token}`);
+    assert.equal(localSnapshot.status, 200);
   });
 });
 
@@ -96,9 +122,9 @@ test("no ambient credential can veto the token the dashboard URL carries", async
 
 test("a stream that dies mid-frame is dropped, not raised at the host", async () => {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-disarm-"));
+  const staticDir = fixtures.tempDirectory("flow-web-disarm-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 5 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, heartbeatMs: 5 });
   const socket = connect(server.port, "127.0.0.1");
   await new Promise((done) => socket.once("connect", done));
   const crlf = String.fromCharCode(13, 10);
@@ -131,9 +157,9 @@ test("a stream that dies mid-frame is dropped, not raised at the host", async ()
 
 test("a stream that stops reading is dropped instead of buffered without bound", async () => {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-backpressure-"));
+  const staticDir = fixtures.tempDirectory("flow-web-backpressure-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, maxStreamBufferBytes: 1 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, maxStreamBufferBytes: 1 });
   try {
     // A socket that never reads: the frames pile up in the host process, which is the user's agent
     // session and not a disposable web server. A backgrounded browser tab is the ordinary way there.
@@ -154,9 +180,9 @@ test("a stream that stops reading is dropped instead of buffered without bound",
 
 test("concurrent streams are capped instead of unbounded", async () => {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-cap-"));
+  const staticDir = fixtures.tempDirectory("flow-web-cap-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, maxStreamClients: 2 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, maxStreamClients: 2 });
   const open: Response[] = [];
   try {
     for (let index = 0; index < 2; index += 1) open.push(await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`));
@@ -207,9 +233,9 @@ test("stream replays deltas after Last-Event-ID and after query cursor", async (
 
 test("stream emits bounded heartbeat comments", async () => {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-heartbeat-"));
+  const staticDir = fixtures.tempDirectory("flow-web-heartbeat-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 10 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, heartbeatMs: 10 });
   try {
     const response = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`);
     const reader = response.body!.getReader();
@@ -230,9 +256,9 @@ test("stream emits bounded heartbeat comments", async () => {
 
 test("shutdown is idempotent and drops an active stream", async () => {
   const store = new EventStore();
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-close-"));
+  const staticDir = fixtures.tempDirectory("flow-web-close-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir });
+  const server = await startTrackedServer({ port: 0, store, staticDir });
   const response = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`);
   assert.equal(server.clientCount(), 1);
   await Promise.all([server.close(), server.close()]);
@@ -296,9 +322,9 @@ test("an unparseable request target is answered instead of killing the host proc
 test("a stream that ages out reaches an already-connected stream client", async () => {
   let now = 1_700_000_000_000;
   const store = new EventStore({ staleAfterMs: 100, now: () => now });
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-stale-"));
+  const staticDir = fixtures.tempDirectory("flow-web-stale-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 20 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, heartbeatMs: 20 });
   const started = { ...event(1), ts: now, type: "instance.started", payload: { displayName: "s", status: "active", pid: 1, contextPercent: 0, exocomEnabled: false } } as TelemetryEvent;
   assert.equal(store.append(started), 1);
   const response = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`);
@@ -372,10 +398,10 @@ function startedEvent(session: string, ts: number): TelemetryEvent {
 test("a sweep that ages out many streams costs a connected client one snapshot frame", async () => {
   let now = 1_700_000_000_000;
   const store = new EventStore({ staleAfterMs: 100, now: () => now });
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-sweep-"));
+  const staticDir = fixtures.tempDirectory("flow-web-sweep-");
   writeFileSync(join(staticDir, "index.html"), "ok");
   // The sweep is driven by hand: an interval firing a second one mid-assertion would forge the count.
-  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 60_000, staleSweepMs: 60_000 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, heartbeatMs: 60_000, staleSweepMs: 60_000 });
   for (let index = 0; index < 40; index += 1) store.append(startedEvent(`aged-${index}`, now));
   const response = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}`);
   const reader = streamReader(response);
@@ -409,7 +435,7 @@ test("a sweep that ages out many streams costs a connected client one snapshot f
 test("a replayed backlog clones the graph only for the frame it actually sends", async () => {
   let now = 1_700_000_000_000;
   const store = new EventStore({ staleAfterMs: 100, now: () => now });
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-replay-"));
+  const staticDir = fixtures.tempDirectory("flow-web-replay-");
   writeFileSync(join(staticDir, "index.html"), "ok");
   // Six sweeps, so the replay window holds six notices however well one sweep coalesces.
   for (let index = 0; index < 6; index += 1) {
@@ -420,7 +446,7 @@ test("a replayed backlog clones the graph only for the frame it actually sends",
   let clones = 0;
   const snapshot = store.snapshot.bind(store);
   store.snapshot = () => { clones += 1; return snapshot(); };
-  const server = await startServer({ port: 0, store, staticDir, heartbeatMs: 60_000, staleSweepMs: 60_000 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, heartbeatMs: 60_000, staleSweepMs: 60_000 });
   const response = await fetch(`http://127.0.0.1:${server.port}/api/stream?token=${server.token}&after=0`);
   const reader = streamReader(response);
   try {
@@ -442,9 +468,9 @@ test("closing the server stops the stale sweep", async () => {
   let sweeps = 0;
   const sweepStale = store.sweepStale.bind(store);
   store.sweepStale = () => { sweeps += 1; return sweepStale(); };
-  const staticDir = mkdtempSync(join(tmpdir(), "flow-web-sweep-close-"));
+  const staticDir = fixtures.tempDirectory("flow-web-sweep-close-");
   writeFileSync(join(staticDir, "index.html"), "ok");
-  const server = await startServer({ port: 0, store, staticDir, staleSweepMs: 5 });
+  const server = await startTrackedServer({ port: 0, store, staticDir, staleSweepMs: 5 });
   await new Promise((resolve) => setTimeout(resolve, 60));
   assert.ok(sweeps > 0, "the server must sweep while it is up");
   await server.close();

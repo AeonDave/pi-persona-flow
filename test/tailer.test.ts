@@ -1,13 +1,28 @@
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, appendFileSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, appendFileSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { EventStore } from "../src/event-store.ts";
 import { entityKey } from "../src/reducer.ts";
-import { logStat, MAX_PARTIAL_LINE_BYTES, MAX_READ_BYTES, TelemetryTailer, workspaceHash } from "../src/tailer.ts";
+import { logStat, MAX_PARTIAL_LINE_BYTES, MAX_READ_BYTES, TelemetryTailer as BaseTelemetryTailer, workspaceHash, type TelemetryTailerOptions } from "../src/tailer.ts";
 import { TELEMETRY_VERSION, type TelemetryEvent } from "../shared/protocol.ts";
+import { createFixtureScope } from "./setup/fixture-scope.ts";
+
+const fixtures = createFixtureScope();
+after(() => fixtures.cleanup());
+
+class TelemetryTailer extends BaseTelemetryTailer {
+  constructor(options: TelemetryTailerOptions) {
+    super(options);
+    fixtures.trackHandle(() => this.stop());
+  }
+}
+
+test("tailer has no runtime Pi package import so the detached service can load it under Node", () => {
+  const source = readFileSync(new URL("../src/tailer.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /from\s+["']@earendil-works\/pi-coding-agent["']/);
+});
 
 function event(workspaceId: string, seq = 1): TelemetryEvent {
   return {
@@ -25,13 +40,56 @@ function event(workspaceId: string, seq = 1): TelemetryEvent {
 }
 
 function fixture() {
-  const agentDir = mkdtempSync(join(tmpdir(), "flow-tailer-"));
+  const agentDir = fixtures.tempDirectory("flow-tailer-");
   const cwd = join(agentDir, "workspace");
   const workspaceId = workspaceHash(cwd);
   const dir = join(agentDir, "pi-persona", "flow", workspaceId);
   mkdirSync(dir, { recursive: true });
   return { agentDir, cwd, workspaceId, dir };
 }
+
+test("TelemetryTailer follows the producer agent directory contract", () => {
+  const f = fixture();
+  const overrideDir = fixtures.tempDirectory("flow-override-");
+  const explicitDir = fixtures.tempDirectory("flow-explicit-");
+  const hostDir = fixtures.tempDirectory("flow-host-");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousCodingAgentDir = process.env.PI_CODING_AGENT_DIR;
+
+  try {
+    process.env.PI_AGENT_DIR = overrideDir;
+    process.env.PI_CODING_AGENT_DIR = hostDir;
+
+    const store = new EventStore();
+    const tailer = new TelemetryTailer({ store, cwd: f.cwd, workspaceId: f.workspaceId, pollMs: 0 });
+    assert.equal(tailer.directory, join(overrideDir, "pi-persona", "flow", f.workspaceId));
+
+    const producerDir = join(overrideDir, "telemetry", "v2", f.workspaceId, "pi-persona");
+    mkdirSync(producerDir, { recursive: true });
+    writeFileSync(join(producerDir, "session.jsonl"), `${JSON.stringify(event(f.workspaceId))}\n`);
+    tailer.start();
+    assert.equal(store.cursor, 1, "the tailer reads the producer's PI_AGENT_DIR override");
+    tailer.stop();
+
+    const explicit = new TelemetryTailer({
+      store: new EventStore(), agentDir: explicitDir, workspaceId: f.workspaceId, pollMs: 0,
+    });
+    assert.equal(explicit.directory, join(explicitDir, "pi-persona", "flow", f.workspaceId));
+
+    process.env.PI_AGENT_DIR = "";
+    const emptyOverride = new TelemetryTailer({ store: new EventStore(), workspaceId: f.workspaceId, pollMs: 0 });
+    assert.equal(emptyOverride.directory, join(hostDir, "pi-persona", "flow", f.workspaceId));
+
+    process.env.PI_AGENT_DIR = "  ";
+    const whitespaceOverride = new TelemetryTailer({ store: new EventStore(), workspaceId: f.workspaceId, pollMs: 0 });
+    assert.equal(whitespaceOverride.directory, join("  ", "pi-persona", "flow", f.workspaceId));
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    if (previousCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousCodingAgentDir;
+  }
+});
 
 test("TelemetryTailer retains a partial JSONL line until its newline arrives", () => {
   const f = fixture();
@@ -496,25 +554,41 @@ test("TelemetryTailer forgets a log that stays gone", () => {
   tailer.stop();
 });
 
+test("a decimal rendering can hide inode precision loss", () => {
+  const exact = 81909218223791020n;
+  const rounded = Number(exact);
+  assert.equal(String(rounded), exact.toString(), "Number stringification uses a shortest round-tripping decimal");
+  assert.notEqual(BigInt(rounded), exact, "converting the number back to BigInt exposes the lost precision");
+});
+
 test("a log's identity is the exact inode, not a truncated double", () => {
   // Identity is the only thing that tells a compaction rename apart from an append, and `fs.Stats.ino`
   // is a JS double. An NTFS file reference is a 64-bit value that does not survive one: distinct files
   // alias onto the same number, and a tailer that misses a replacement keeps its old offset and
   // resumes mid-file — skipping the head, which is exactly where the producer parks its replay seeds.
-  const dir = mkdtempSync(join(tmpdir(), "flow-ino-"));
-  let lossy: string | undefined;
-  let first: string | undefined;
-  for (let index = 0; index < 600 && lossy === undefined; index += 1) {
-    const file = join(dir, `probe-${index}.jsonl`);
-    writeFileSync(file, "{}\n");
-    first ??= file;
-    if (BigInt(statSync(file).ino) !== statSync(file, { bigint: true }).ino) lossy = file;
-  }
-  const probe = lossy ?? first!;
-  const exact = statSync(probe, { bigint: true });
-  assert.equal(logStat(probe).identity, `${exact.dev}:${exact.ino}`);
-  if (lossy) {
-    const truncated = statSync(lossy);
-    assert.notEqual(logStat(lossy).identity, `${truncated.dev}:${truncated.ino}`, "the truncated value is a different file's answer");
+  const dir = fixtures.tempDirectory("flow-ino-");
+  try {
+    let lossy: string | undefined;
+    let first: string | undefined;
+    for (let index = 0; index < 600 && lossy === undefined; index += 1) {
+      const file = join(dir, `probe-${index}.jsonl`);
+      writeFileSync(file, "{}\n");
+      first ??= file;
+      if (BigInt(statSync(file).ino) !== statSync(file, { bigint: true }).ino) lossy = file;
+    }
+    const probe = lossy ?? first!;
+    const exact = statSync(probe, { bigint: true });
+    assert.equal(logStat(probe).identity, `${exact.dev}:${exact.ino}`);
+    if (lossy) {
+      const truncated = statSync(lossy);
+      assert.notEqual(BigInt(truncated.ino), exact.ino, "the selected numeric inode lost precision");
+      assert.notEqual(
+        logStat(lossy).identity,
+        `${BigInt(truncated.dev)}:${BigInt(truncated.ino)}`,
+        "the truncated inode is a different file identity",
+      );
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

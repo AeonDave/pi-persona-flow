@@ -1,258 +1,235 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { VERSION } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
-
-import { LEGACY_TELEMETRY_EVENT_NAME, TELEMETRY_EVENT_NAME } from "../shared/protocol.ts";
-import { EventStore } from "./event-store.ts";
-import { startServer, type FlowServer } from "./server.ts";
-import { TelemetryTailer, workspaceHash } from "./tailer.ts";
+import { LEGACY_TELEMETRY_EVENT_NAME, parseTelemetryEvent, TELEMETRY_EVENT_NAME } from "../shared/protocol.ts";
+import { connectFlowService } from "./service/client.ts";
+import { workspaceHash } from "./tailer.ts";
 import { isSupportedPiVersion, MIN_PI_VERSION } from "./pi-compat.ts";
 
-const DEFAULT_PORT = 7874;
+type Connection = Awaited<ReturnType<typeof connectFlowService>>;
+export interface FlowExtensionOptions {
+  connect?: typeof connectFlowService;
+  heartbeatMs?: number;
+  flushMs?: number;
+}
 
-/** Pi extension entry point for the file-backed, explicit telemetry dashboard. */
-export default function piPersonaFlow(pi: ExtensionAPI): void {
+/** Thin Pi attachment: the detached service, not the first Pi, owns the viewer. */
+export default function piPersonaFlow(pi: ExtensionAPI): void { createExtension(pi); }
+
+export function createExtension(pi: ExtensionAPI, options: FlowExtensionOptions = {}): void {
   if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-flow requires Pi ${MIN_PI_VERSION}+ (found ${VERSION}).`);
-  let store: EventStore | undefined;
-  let tailer: TelemetryTailer | undefined;
-  let server: FlowServer | undefined;
-  let pendingStart: Promise<FlowServer | undefined> | undefined;
-  let serverGeneration = 0;
-  let unsubscribeTelemetry: (() => void) | undefined;
-  let unsubscribeStatus: (() => void) | undefined;
+  if (process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1") return;
+  const connect = options.connect ?? connectFlowService;
+  const heartbeatMs = options.heartbeatMs ?? 5_000;
+  const flushMs = options.flushMs ?? 10;
+  type Attachment = {
+    ctx: ExtensionContext;
+    workspaceId: string;
+    controller: AbortController;
+    closed: boolean;
+    healthy: boolean;
+    connection?: Connection;
+    opening?: Promise<Connection | undefined>;
+    timer?: ReturnType<typeof setInterval>;
+    flush?: ReturnType<typeof setTimeout>;
+    heartbeatPending: boolean;
+    publishing: boolean;
+    delivery?: Promise<void>;
+    queue: unknown[];
+    bytes: number;
+    unsubscribe: Array<() => void>;
+    diagnostics: Set<string>;
+    lastStatus?: string;
+  };
+  let active: Attachment | undefined;
   let generation = 0;
-  let port = resolvePort();
+  const disabled = (): boolean => pi.getFlag("no-flow") === true;
 
-  function resolvePort(): number {
-    const value = (process.env.PI_PERSONA_FLOW_PORT ?? "").trim();
-    return /^\d+$/.test(value) ? Number(value) : DEFAULT_PORT;
+  function report(ctx: ExtensionContext, text: string, warning = false, automatic = false): void {
+    if (ctx.hasUI) { try { ctx.ui.notify(text, warning ? "warning" : "info"); } catch { /* UI teardown */ } }
+    else (automatic ? process.stderr : process.stdout).write(`${text}\n`);
   }
-
-  function autostart(): boolean {
-    if (pi.getFlag("flow") === true) return true;
-    return /^(1|true|on|yes)$/i.test((process.env.PI_PERSONA_FLOW_AUTOSTART ?? "").trim());
+  function warn(a: Attachment, key: string, text: string): void {
+    if (a.closed || active !== a || a.diagnostics.has(key)) return;
+    if (a.diagnostics.size < 16) a.diagnostics.add(key);
+    report(a.ctx, `pi-persona-flow: ${text}`, true, true);
   }
-
-  function openBrowser(url: string): void {
-    const { cmd, args } = browserLaunch(process.platform, url);
-    spawn(cmd, args, { stdio: "ignore", detached: true }).on("error", () => undefined).unref();
+  function status(a: Attachment): void {
+    if (a.closed || active !== a || !a.ctx.hasUI) return;
+    const value = a.connection && a.healthy
+      ? `flow ${new URL(a.connection.url).host} · workspace ${a.workspaceId.slice(0, 8)}`
+      : "flow unavailable · /dashboard serve";
+    if (value === a.lastStatus) return;
+    try { a.ctx.ui.setStatus("flow", value); a.lastStatus = value; } catch { /* UI teardown */ }
   }
-
-  async function startIfNeeded(): Promise<FlowServer | undefined> {
-    if (server) return server;
-    if (pendingStart) return pendingStart;
-    const thisGeneration = generation;
-    const thisServerGeneration = serverGeneration;
-    const currentStore = store;
-    if (!currentStore) return undefined;
-    const opening = (async () => {
-      let candidate: FlowServer;
-      try {
-        candidate = await startServer({ port, store: currentStore });
-      } catch {
-        candidate = await startServer({ port: 0, store: currentStore });
+  function announce(a: Attachment, automatic: boolean): void {
+    if (a.closed || active !== a || !a.connection || !a.healthy) return;
+    const line = dashboardListeningLine(a.connection.url);
+    status(a);
+    if (!a.ctx.hasUI) { report(a.ctx, line, false, automatic); return; }
+    try { a.ctx.ui.setWidget("flow", [line], { placement: "aboveEditor" }); } catch { /* RPC / UI teardown */ }
+  }
+  function scheduleFlush(a: Attachment): void {
+    if (a.closed || active !== a || !a.healthy || !a.connection || a.publishing || a.flush || a.queue.length === 0) return;
+    a.flush = setTimeout(() => { delete a.flush; void flush(a); }, flushMs);
+    a.flush.unref();
+  }
+  async function deliver(connection: Connection, batch: readonly unknown[]): Promise<void> {
+    // A lost response is ambiguous, not proof the server rejected the events. IDs are immutable
+    // and the service deduplicates, so one bounded retry preserves bus-only producers safely.
+    try { await connection.publish(batch); }
+    catch { await new Promise((done) => setTimeout(done, 50)); await connection.publish(batch); }
+  }
+  async function flush(a: Attachment): Promise<void> {
+    if (a.closed || active !== a || !a.connection || a.publishing || !a.healthy || a.queue.length === 0) return;
+    const batch = a.queue;
+    a.queue = []; a.bytes = 0; a.publishing = true;
+    const connection = a.connection;
+    const delivery = deliver(connection, batch);
+    a.delivery = delivery;
+    try { await delivery; }
+    catch { warn(a, "publish", "live telemetry delivery failed; file-backed history will catch up. Bus-only events in this batch were not delivered."); }
+    finally { delete a.delivery; a.publishing = false; scheduleFlush(a); }
+  }
+  function subscribe(a: Attachment): void {
+    const ingest = (value: unknown): void => {
+      if (a.closed || active !== a) return;
+      const parsed = parseTelemetryEvent(value);
+      if (!parsed || parsed.workspaceId !== a.workspaceId) return;
+      const bytes = Buffer.byteLength(JSON.stringify(parsed), "utf8");
+      if (a.queue.length >= 256 || a.bytes + bytes > 1_048_576) {
+        warn(a, "overload", "live telemetry queue is full; excess bus events were dropped. File-backed history remains available.");
+        return;
       }
-      if (thisGeneration !== generation || thisServerGeneration !== serverGeneration || store !== currentStore) {
-        await candidate.close();
+      a.queue.push(parsed); a.bytes += bytes;
+      scheduleFlush(a);
+    };
+    a.unsubscribe.push(pi.events.on(TELEMETRY_EVENT_NAME, ingest), pi.events.on(LEGACY_TELEMETRY_EVENT_NAME, ingest));
+  }
+  async function heartbeat(a: Attachment): Promise<void> {
+    if (a.closed || active !== a || !a.connection || a.heartbeatPending) return;
+    a.heartbeatPending = true;
+    try { await a.connection.heartbeat(); }
+    catch {
+      a.healthy = false;
+      if (a.timer) clearInterval(a.timer);
+      warn(a, "heartbeat", "shared service is unavailable. Run /dashboard serve to reconnect.");
+      status(a);
+    } finally { a.heartbeatPending = false; }
+  }
+  async function detach(a: Attachment | undefined): Promise<void> {
+    if (!a || a.closed) return;
+    a.closed = true;
+    a.controller.abort();
+    if (a.timer) clearInterval(a.timer);
+    if (a.flush) clearTimeout(a.flush);
+    for (const unsubscribe of a.unsubscribe) unsubscribe();
+    const finalBatch = a.queue;
+    a.queue = []; a.bytes = 0;
+    if (a.ctx.hasUI) {
+      try { a.ctx.ui.setWidget("flow", undefined); a.ctx.ui.setStatus("flow", undefined); } catch { /* UI teardown */ }
+    }
+    // A cancelled connect may finish late. open() closes that result before resolving.
+    await a.opening?.catch(() => undefined);
+    // Keep bus-only terminal events too. Client HTTP deadlines bound this join; no unbounded
+    // producer shutdown wait, and no publish/unregister race against an existing request.
+    const deliveryFailed = (): void => report(a.ctx, "pi-persona-flow: final live telemetry delivery failed; file-backed history remains available.", true, true);
+    await a.delivery?.catch(deliveryFailed);
+    if (a.connection && a.healthy && finalBatch.length) await deliver(a.connection, finalBatch).catch(deliveryFailed);
+    await a.connection?.close().catch(() => undefined);
+  }
+  function attach(ctx: ExtensionContext): Promise<Connection | undefined> {
+    if (active && !active.closed) return active.opening ?? Promise.resolve(active.connection);
+    const a: Attachment = {
+      ctx, workspaceId: workspaceHash(ctx.cwd), controller: new AbortController(), closed: false,
+      healthy: false, heartbeatPending: false, publishing: false, queue: [], bytes: 0,
+      unsubscribe: [], diagnostics: new Set(),
+    };
+    active = a;
+    subscribe(a);
+    const portValue = process.env.PI_PERSONA_FLOW_PORT ?? "";
+    const port = /^\d+$/.test(portValue) && Number(portValue) <= 65_535 ? Number(portValue) : 7874;
+    const opening = (async () => {
+      try {
+        const connection = await connect({
+          agentDir: process.env.PI_AGENT_DIR || getAgentDir(), cwd: ctx.cwd,
+          sessionId: ctx.sessionManager.getSessionId(), port, signal: a.controller.signal,
+        });
+        if (a.closed || active !== a) { await connection.close(); return undefined; }
+        a.connection = connection; a.healthy = true;
+        a.timer = setInterval(() => { void heartbeat(a); }, heartbeatMs);
+        a.timer.unref();
+        scheduleFlush(a);
+        return connection;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 600) : "unknown startup error";
+        warn(a, "startup", `could not attach to the shared service: ${detail}. Run /dashboard serve to retry.`);
+        status(a);
         return undefined;
       }
-      server = candidate;
-      port = candidate.port;
-      return candidate;
     })();
-    pendingStart = opening;
-    try { return await opening; }
-    finally { if (pendingStart === opening) pendingStart = undefined; }
-  }
-
-  async function stopServer(): Promise<void> {
-    serverGeneration += 1;
-    const opening = pendingStart;
-    pendingStart = undefined;
-    const current = server;
-    server = undefined;
-    await Promise.all([current?.close(), opening?.catch(() => undefined)]);
-  }
-
-  type SessionUi = {
-    hasUI: boolean;
-    ui: {
-      notify(message: string, type?: "info" | "warning" | "error"): void;
-      setStatus(key: string, text: string | undefined): void;
-      setWidget?(key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
-    };
-  };
-  let sessionUi: SessionUi | undefined;
-  let lastStatus: string | undefined;
-
-  function listeningHostPort(): string | undefined {
-    if (!server) return undefined;
-    try {
-      const parsed = new URL(server.url);
-      return `${parsed.hostname}:${parsed.port || String(server.port)}`;
-    } catch {
-      return `127.0.0.1:${server.port}`;
-    }
-  }
-
-  function statusText(): string {
-    // Runs on every ingested event, so it reads the graph in place instead of deep-copying it.
-    const state = store?.peek();
-    if (!state) return "flow stopped";
-    const agents = Object.keys(state.agents).length;
-    const peers = Object.keys(state.peers).length;
-    // Host:port in the footer so `--flow` is not a mystery. Never a tokenless `http://…` —
-    // that 401s. The clickable tokenized URL lives on the widget / notify / stdout line.
-    const dashboard = listeningHostPort() ?? "stopped";
-    return `flow ${dashboard} · ${agents} agents · ${peers} peers`;
-  }
-
-  function announceListening(url: string): void {
-    const line = dashboardListeningLine(url);
-    if (!sessionUi?.hasUI) {
-      process.stdout.write(`${line}\n`);
-      return;
-    }
-    updateStatus();
-    // Widget only — a toast of the same line stacks above the exocom row and duplicates it.
-    try { sessionUi.ui.setWidget?.("flow", [line], { placement: "aboveEditor" }); } catch { /* older Pi / RPC */ }
-  }
-
-  function hideListening(): void {
-    if (!sessionUi?.hasUI) return;
-    try { sessionUi.ui.setWidget?.("flow", undefined); } catch { /* older Pi / RPC */ }
-    updateStatus();
-  }
-
-  function updateStatus(): void {
-    if (!sessionUi?.hasUI) return;
-    const value = statusText();
-    if (value === lastStatus) return;
-    try {
-      sessionUi.ui.setStatus("flow", value);
-      lastStatus = value;
-    } catch { /* Retry on the next event if the UI was unavailable. */ }
+    a.opening = opening;
+    void opening.finally(() => { if (a.opening === opening) delete a.opening; });
+    return opening;
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    generation += 1;
-    const startupGeneration = generation;
-    await stopServer();
-    if (generation !== startupGeneration) return;
-    sessionUi = ctx;
-    lastStatus = undefined;
-    unsubscribeTelemetry?.();
-    unsubscribeTelemetry = undefined;
-    unsubscribeStatus?.();
-    unsubscribeStatus = undefined;
-    tailer?.stop();
-    tailer = undefined;
-    port = resolvePort();
-    const currentGeneration = generation;
-    const cwd = ctx.cwd;
-    const workspaceId = workspaceHash(cwd);
-    const nextStore = new EventStore();
-    const nextTailer = new TelemetryTailer({ store: nextStore, workspaceId, cwd });
-    store = nextStore;
-    tailer = nextTailer;
-    nextTailer.start();
-
-    if (pi.events) {
-      const ingest = (value: unknown): void => {
-        if (generation === currentGeneration) nextTailer.ingest(value);
-      };
-      const unsubscribeV2 = pi.events.on(TELEMETRY_EVENT_NAME, ingest);
-      const unsubscribeLegacy = pi.events.on(LEGACY_TELEMETRY_EVENT_NAME, ingest);
-      unsubscribeTelemetry = () => { unsubscribeV2(); unsubscribeLegacy(); };
-    }
-
-    unsubscribeStatus = nextStore.subscribe(() => {
-      updateStatus();
-    });
-    updateStatus();
-    if (autostart()) {
-      const started = await startIfNeeded();
-      if (started && generation === currentGeneration) announceListening(started.url);
-    }
+    const epoch = ++generation;
+    const previous = active; active = undefined;
+    await detach(previous);
+    if (generation !== epoch || disabled()) return;
+    await attach(ctx);
+    if (generation === epoch && active) announce(active, true);
   });
-
-  // Keep the lifecycle hooks registered for Pi versions that expose them; all
-  // graph data comes from the explicit telemetry contract, never tool heuristics.
-  pi.on("session_info_changed", () => undefined);
-  pi.on("turn_start", () => undefined);
-  pi.on("before_agent_start", () => undefined);
-  pi.on("tool_call", () => undefined);
-  pi.on("tool_result", () => undefined);
-  pi.on("agent_settled", () => undefined);
-
   pi.on("session_shutdown", async () => {
-    generation += 1;
-    unsubscribeTelemetry?.();
-    unsubscribeTelemetry = undefined;
-    unsubscribeStatus?.();
-    unsubscribeStatus = undefined;
-    tailer?.stop();
-    tailer = undefined;
-    await stopServer();
-    hideListening();
-    store = undefined;
-    sessionUi = undefined;
+    ++generation;
+    const previous = active; active = undefined;
+    await detach(previous);
   });
-
-  // NOT "flow": pi-persona already owns /flow for running a flow (a DAG over strategies). It wins the
-  // registration, so "/flow open" resolves to "run a flow named open" and this dashboard becomes
-  // unreachable by command while still serving on its port. This companion yields the name;
-  // it can also run standalone with any compatible producer.
   pi.registerCommand("dashboard", {
-    description: "Open the live telemetry dashboard",
+    description: "Open the shared workspace telemetry dashboard",
     handler: async (args, ctx) => {
+      if (disabled()) { report(ctx, "pi-persona-flow: disabled for this run by --no-flow."); return; }
       const sub = (args ?? "").trim().toLowerCase();
-      if (!["", "open", "serve", "status", "stop"].includes(sub)) {
-        if (ctx.hasUI) ctx.ui.notify("Usage: /dashboard [open|serve|status|stop]", "warning");
-        else process.stdout.write("Usage: /dashboard [open|serve|status|stop]\n");
-        return;
-      }
+      if (!["", "open", "serve", "status", "stop"].includes(sub)) { report(ctx, "Usage: /dashboard [open|serve|status|stop]", true); return; }
       if (sub === "stop") {
-        await stopServer();
-        hideListening();
-        if (ctx.hasUI) ctx.ui.notify("pi-persona-flow: dashboard stopped.", "info");
+        ++generation;
+        const previous = active; active = undefined;
+        await detach(previous);
+        report(ctx, "pi-persona-flow: detached this session; the shared dashboard remains available.");
         return;
       }
       if (sub === "status") {
-        const text = server ? dashboardListeningLine(server.url) : "flow dashboard stopped";
-        if (ctx.hasUI) ctx.ui.notify(text, "info");
-        else process.stdout.write(`${text}\n`);
+        report(ctx, active?.connection && active.healthy ? dashboardListeningLine(active.connection.url) : "flow dashboard detached or unavailable for this run");
         return;
       }
-      const started = await startIfNeeded();
-      if (!started) {
-        if (ctx.hasUI) ctx.ui.notify("pi-persona-flow: no active session.", "error");
-        return;
+      const epoch = generation;
+      if (active && !active.healthy && !active.opening) {
+        const previous = active; active = undefined;
+        await detach(previous);
+        if (generation !== epoch) return;
       }
-      if (sub === "" || sub === "open") openBrowser(started.url);
-      announceListening(started.url);
+      const connection = await attach(ctx);
+      if (!connection || generation !== epoch || active?.connection !== connection) return;
+      if (sub === "" || sub === "open") {
+        const { cmd, args: browserArgs } = browserLaunch(process.platform, connection.url);
+        spawn(cmd, browserArgs, { stdio: "ignore", detached: true, windowsHide: true }).on("error", () => undefined).unref();
+      }
+      announce(active, false);
     },
   });
-
-  pi.registerFlag("flow", {
-    type: "boolean",
-    default: false,
-    description: "Auto-start the pi-persona-flow dashboard on session start",
+  pi.registerFlag("no-flow", {
+    type: "boolean", default: false,
+    description: "Do not attach this run to the shared pi-persona-flow dashboard",
   });
 }
 
-/** The line `--flow` and `/dashboard` put on screen: host, port, and the token that actually opens it. */
-export function dashboardListeningLine(url: string): string {
-  return `flow dashboard at ${url}`;
-}
-
-/** Never `cmd /c start`: cmd.exe re-parses `&` `|` `^` in the URL before `start` runs.
- *  Match Pi's own launcher — rundll32 on Windows, and always attach an error listener. */
+export function dashboardListeningLine(url: string): string { return `flow dashboard at ${url}`; }
+/** No cmd.exe reparsing of URL metacharacters; errors are handled by the caller. */
 export function browserLaunch(platform: NodeJS.Platform, url: string): { cmd: string; args: string[] } {
   if (platform === "darwin") return { cmd: "open", args: [url] };
   if (platform === "win32") return { cmd: "rundll32", args: ["url.dll,FileProtocolHandler", url] };
   return { cmd: "xdg-open", args: [url] };
 }
-
-export { EventStore, TelemetryTailer, workspaceHash };
+export { EventStore } from "./event-store.ts";
+export { TelemetryTailer, workspaceHash } from "./tailer.ts";
 export type { FlowServer } from "./server.ts";

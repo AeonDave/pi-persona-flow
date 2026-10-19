@@ -1,6 +1,6 @@
 /** Load packed extension AND shipped web assets through the real minimum Pi SDK. */
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { runtimeHarness } from "../test/setup/pi-runtime.ts";
@@ -12,7 +12,7 @@ process.env.PI_PERSONA_FLOW_PORT = "0";
 let h: Awaited<ReturnType<typeof runtimeHarness>> | undefined;
 try {
   h = await runtimeHarness(root, resolve(process.argv[2]));
-  h.session.extensionRunner!.setFlagValue("flow", true);
+  await assert.rejects(stat(join(resolve(process.argv[2]), "..", "..", "node_modules")), { code: "ENOENT" }, "the extracted package has no runtime dependency installation");
   await h.bind();
   const url = h.widgets.find((line) => line.startsWith("flow dashboard at "))?.slice("flow dashboard at ".length);
   assert.ok(url);
@@ -26,7 +26,7 @@ try {
   assert.ok((await asset.text()).length > 1000);
   await h.dispose();
   await assert.rejects(fetch(url));
-  console.log("PASS: extracted Flow package loaded in Pi 1.0; shipped HTML/JS served, server closed.");
+  console.log("PASS: extracted Flow package loaded in Pi 1.0; native detached service with no package node_modules served shipped HTML/JS and completed idle shutdown.");
 } finally {
   try { await h?.dispose(); }
   finally {

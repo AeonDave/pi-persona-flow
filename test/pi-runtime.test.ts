@@ -24,7 +24,6 @@ test("real Pi 1.0: autostart, authenticated telemetry API, bounded UI updates an
   let h: Harness | undefined;
   try {
     h = await runtimeHarness(root, entry);
-    h.session.extensionRunner!.setFlagValue("flow", true);
     await h.bind();
     const url = h.widgets.find((line) => line.startsWith("flow dashboard at "))?.slice("flow dashboard at ".length);
     assert.ok(url, "the loaded extension announces the actual authenticated URL");
@@ -34,17 +33,24 @@ test("real Pi 1.0: autostart, authenticated telemetry API, bounded UI updates an
     withoutToken.search = "";
     assert.equal((await fetch(withoutToken)).status, 401);
     publish(h, 1, "agent.added", { id: "run-9", label: "Dewglass", kind: "subagent", status: "waiting" });
-    const response = await fetch(endpoint);
-    assert.equal(response.status, 200);
-    const snapshot = await response.json() as { state: { agents: Record<string, { label: string; status: string }> } };
-    assert.ok(Object.values(snapshot.state.agents).some((agent) => agent.label === "Dewglass" && agent.status === "waiting"));
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      const response = await fetch(endpoint);
+      assert.equal(response.status, 200);
+      const snapshot = await response.json() as { state: { agents: Record<string, { label: string; status: string }> } };
+      if (Object.values(snapshot.state.agents).some((agent) => agent.label === "Dewglass" && agent.status === "waiting")) break;
+      assert.ok(Date.now() < deadline, "bus telemetry reaches the shared service");
+      await new Promise((done) => setTimeout(done, 10));
+    }
     const before = h.statuses.length;
     for (let seq = 2; seq <= 101; seq += 1) publish(h, seq, "instance.heartbeat", { status: "active", contextPercent: seq % 100 });
     assert.equal(h.statuses.length, before, "unchanged footer must not schedule 100 redraws");
     const command = h.session.extensionRunner!.getCommand("dashboard");
     assert.ok(command);
     await command.handler("stop", h.session.extensionRunner!.createCommandContext());
-    await assert.rejects(fetch(endpoint), /fetch failed/);
+    assert.equal((await fetch(endpoint)).status, 200, "detaching a Pi must not kill its shared service");
+    await command.handler("status", h.session.extensionRunner!.createCommandContext());
+    assert.match(h.notifications.at(-1)!, /detached/);
   } finally {
     await h?.dispose();
     if (previousPort === undefined) delete process.env.PI_PERSONA_FLOW_PORT;
@@ -53,7 +59,7 @@ test("real Pi 1.0: autostart, authenticated telemetry API, bounded UI updates an
   }
 });
 
-test("real Pi 1.0: concurrent dashboard starts share one server and stop cancels a pending start", { timeout: 30_000 }, async () => {
+test("real Pi 1.0: concurrent attachments share one service and stop cancels pending attachment", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "flow-pi-start-"));
   const previousPort = process.env.PI_PERSONA_FLOW_PORT;
   process.env.PI_PERSONA_FLOW_PORT = "0";
@@ -65,16 +71,18 @@ test("real Pi 1.0: concurrent dashboard starts share one server and stop cancels
     const runner = h.session.extensionRunner!;
     const command = runner.getCommand("dashboard")!;
     const context = runner.createCommandContext();
+    await command.handler("stop", context);
+    h.widgets.length = 0;
     // Unknown commands are a useful negative control: they must not allocate a listener.
     await command.handler("typo", context);
     assert.equal(h.widgets.length, 0, "unknown subcommands do not start a hidden server");
     await command.handler("status", context);
-    assert.equal(h.notifications.at(-1), "flow dashboard stopped", "no listener was allocated silently");
+    assert.equal(h.notifications.at(-1), "flow dashboard detached or unavailable for this run", "the session remains detached");
     await Promise.all([command.handler("serve", context), command.handler("serve", context)]);
     announced.push(...h.widgets.map((line) => line.slice("flow dashboard at ".length)));
     assert.equal(new Set(announced).size, 1, "concurrent calls share one listener/token");
     await command.handler("stop", context);
-    for (const url of announced) await assert.rejects(fetch(url), /fetch failed/);
+    for (const url of announced) assert.equal((await fetch(url)).status, 200, "shared service survives a session detach");
     h.widgets.length = 0;
     const pending = command.handler("serve", context);
     await command.handler("stop", context);

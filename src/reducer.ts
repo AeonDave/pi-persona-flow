@@ -8,7 +8,7 @@ import type {
   TelemetryEvent,
   ToolDescriptor,
 } from "../shared/protocol.ts";
-import { isKnownTelemetryEvent } from "../shared/protocol.js";
+import { isKnownTelemetryEvent } from "../shared/protocol.ts";
 
 
 export interface InstanceView extends InstanceDescriptor {

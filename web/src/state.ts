@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { parseTelemetryEvent, type TelemetryEvent } from "../../shared/protocol";
+import type { WorkspaceCatalog, WorkspaceSummary } from "../../shared/workspaces";
 import { createGraphState, entityKey, fallbackInstance, reduceTelemetry, type AgentView, type GraphState, type InstanceView } from "../../src/reducer";
 
 export type ConnectionState = "connecting" | "live" | "offline";
@@ -16,6 +17,9 @@ export interface DashboardState {
   graph: GraphState;
   cursor: number;
   connection: ConnectionState;
+  workspaces: WorkspaceSummary[];
+  selectedWorkspaceId: string;
+  selectWorkspace: (id: string) => void;
   error?: string;
 }
 
@@ -55,66 +59,194 @@ function tokenFromLocation(): string {
   return new URLSearchParams(window.location.search).get("token") ?? "";
 }
 
-function endpoint(path: string, token: string, extra = ""): string {
+function workspaceFromLocation(): string {
+  return typeof window === "undefined" ? "" : new URLSearchParams(window.location.search).get("workspace") ?? "";
+}
+
+function setWorkspaceInLocation(workspaceId: string, replace: boolean): void {
+  const url = new URL(window.location.href);
+  if (workspaceId) url.searchParams.set("workspace", workspaceId);
+  else url.searchParams.delete("workspace");
+  const destination = `${url.pathname}${url.search}${url.hash}`;
+  if (replace) window.history.replaceState(window.history.state, "", destination);
+  else window.history.pushState(window.history.state, "", destination);
+}
+
+function parseWorkspaceCatalog(value: unknown): WorkspaceCatalog | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const candidate = value as { workspaces?: unknown; defaultWorkspaceId?: unknown };
+  if (!Array.isArray(candidate.workspaces)) return undefined;
+  const workspaces: WorkspaceSummary[] = [];
+  for (const value of candidate.workspaces) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const workspace = value as Partial<WorkspaceSummary>;
+    if (typeof workspace.id !== "string" || workspace.id.length === 0
+      || typeof workspace.label !== "string" || typeof workspace.activeSessions !== "number"
+      || !Number.isInteger(workspace.activeSessions) || workspace.activeSessions < 0
+      || typeof workspace.lastSeenAt !== "number" || !Number.isFinite(workspace.lastSeenAt)) return undefined;
+    workspaces.push(workspace as WorkspaceSummary);
+  }
+  if (candidate.defaultWorkspaceId !== undefined && typeof candidate.defaultWorkspaceId !== "string") return undefined;
+  return {
+    workspaces,
+    ...(typeof candidate.defaultWorkspaceId === "string" ? { defaultWorkspaceId: candidate.defaultWorkspaceId } : {}),
+  };
+}
+
+function endpoint(path: string, token: string, workspaceId = "", after = ""): string {
   const params = new URLSearchParams({ token });
-  if (extra) params.set("after", extra);
+  if (workspaceId) params.set("workspace", workspaceId);
+  if (after) params.set("after", after);
   return `${path}?${params.toString()}`;
 }
 
 export function useDashboard(): DashboardState {
-  const [state, setState] = useState<DashboardState>({ graph: createGraphState(), cursor: 0, connection: "connecting" });
+  const [stream, setStream] = useState<Omit<DashboardState, "workspaces" | "selectedWorkspaceId" | "selectWorkspace">>({ graph: createGraphState(), cursor: 0, connection: "connecting" });
+  const [catalog, setCatalog] = useState<WorkspaceCatalog>({ workspaces: [] });
+  const [catalogLoaded, setCatalogLoaded] = useState(false);
+  const [catalogError, setCatalogError] = useState<string>();
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState(workspaceFromLocation);
+  const seenWorkspaceIds = useRef(new Set<string>());
 
   useEffect(() => {
+    let disposed = false;
+    let inFlight: AbortController | undefined;
     const token = tokenFromLocation();
+    const refreshCatalog = async (): Promise<void> => {
+      if (inFlight) return;
+      const controller = new AbortController();
+      inFlight = controller;
+      try {
+        const response = await fetch(endpoint("/api/workspaces", token), {
+          headers: { Accept: "application/json" }, signal: controller.signal,
+        });
+        if (response.status === 401 || response.status === 403) throw new Error("Not authorized — this dashboard needs its session token. Run /dashboard in pi, or /dashboard status to copy the link.");
+        if (!response.ok) throw new Error(`workspace catalog returned ${response.status}`);
+        const next = parseWorkspaceCatalog(await response.json());
+        if (!next) throw new Error("workspace catalog schema is incompatible");
+        if (disposed) return;
+        for (const workspace of next.workspaces) seenWorkspaceIds.current.add(workspace.id);
+        setCatalog(next);
+        setCatalogLoaded(true);
+        setCatalogError(undefined);
+      } catch (error) {
+        if (disposed || (error instanceof DOMException && error.name === "AbortError")) return;
+        setCatalogError(error instanceof Error ? error.message : "Unable to load workspace catalog");
+      } finally {
+        if (inFlight === controller) inFlight = undefined;
+      }
+    };
+
+    void refreshCatalog();
+    const timer = window.setInterval(() => { void refreshCatalog(); }, 2000);
+    return () => { disposed = true; window.clearInterval(timer); inFlight?.abort(); };
+  }, []);
+
+  useEffect(() => {
+    const onPopState = (): void => setSelectedWorkspaceId(workspaceFromLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!catalogLoaded) return;
+    const hasWorkspace = (id: string): boolean => catalog.workspaces.some((workspace) => workspace.id === id);
+    const requested = workspaceFromLocation();
+    const requestedWasKnown = requested !== "" && seenWorkspaceIds.current.has(requested);
+    const currentWasKnown = selectedWorkspaceId !== "" && seenWorkspaceIds.current.has(selectedWorkspaceId);
+    const fallback = (catalog.defaultWorkspaceId && hasWorkspace(catalog.defaultWorkspaceId)
+      ? catalog.defaultWorkspaceId : catalog.workspaces[0]?.id) ?? "";
+    // An explicit unknown URL remains explicit so the workspace endpoint can return 404; it must
+    // never quietly show another workspace. A workspace removed from the live catalog falls back.
+    const next = requested && hasWorkspace(requested) ? requested
+      : requested && !requestedWasKnown ? requested
+        : selectedWorkspaceId && hasWorkspace(selectedWorkspaceId) ? selectedWorkspaceId
+          : selectedWorkspaceId && !currentWasKnown ? selectedWorkspaceId
+            : fallback;
+    if (next !== selectedWorkspaceId) setSelectedWorkspaceId(next);
+    if (next !== requested) setWorkspaceInLocation(next, true);
+  }, [catalog, catalogLoaded, selectedWorkspaceId]);
+
+  const selectionState = selectedWorkspaceId === "" ? "none"
+    : catalog.workspaces.some((workspace) => workspace.id === selectedWorkspaceId) ? "available"
+      : seenWorkspaceIds.current.has(selectedWorkspaceId) ? "removed" : "explicit-unknown";
+
+  useEffect(() => {
+    if (!catalogLoaded) return;
+    if (selectionState === "none" || selectionState === "removed") {
+      setStream({ graph: createGraphState(), cursor: 0, connection: "offline" });
+      return;
+    }
+
+    const token = tokenFromLocation();
+    const workspaceId = selectedWorkspaceId;
+    const controller = new AbortController();
     let source: EventSource | undefined;
     let disposed = false;
+    setStream({ graph: createGraphState(), cursor: 0, connection: "connecting" });
 
-    const failFrame = (): void => setState((current) => ({ ...current, error: "Received an unreadable telemetry frame" }));
+    const failFrame = (): void => { if (!disposed) setStream((current) => ({ ...current, error: "Received an unreadable telemetry frame" })); };
     const load = async (): Promise<void> => {
       try {
-        const response = await fetch(endpoint("/api/snapshot", token), { headers: { Accept: "application/json" } });
-        // A token-gated dashboard opened by hand is the ordinary way to land here: say what to do
-        // rather than a bare status code, which reads as "the dashboard is broken".
+        const response = await fetch(endpoint("/api/snapshot", token, workspaceId), {
+          headers: { Accept: "application/json" }, signal: controller.signal,
+        });
         if (response.status === 401 || response.status === 403) {
           throw new Error("Not authorized — this dashboard needs its session token. Run /dashboard in pi, or /dashboard status to copy the link.");
         }
+        if (response.status === 404) throw new Error("Workspace not found — choose a workspace from the refreshed list.");
         if (!response.ok) throw new Error(`snapshot returned ${response.status}`);
         const initial = snapshotFrame(await response.json());
         if (!initial) throw new Error("snapshot schema is incompatible");
-        // Bail before opening the stream, not just before the setState: unmounting while the snapshot
-        // was in flight left cleanup with `source` still undefined, stranding the connection it opened
-        // a tick later — once per mount under StrictMode's double-mount.
-        if (disposed) return;
-        setState({ graph: initial.state, cursor: initial.cursor, connection: "connecting" });
-        source = new EventSource(endpoint("/api/stream", token, String(initial.cursor)));
-        source.onopen = () => setState((current) => ({ ...current, connection: "live", error: undefined }));
+        if (disposed || controller.signal.aborted) return;
+        setStream({ graph: initial.state, cursor: initial.cursor, connection: "connecting" });
+        source = new EventSource(endpoint("/api/stream", token, workspaceId, String(initial.cursor)));
+        source.onopen = () => { if (!disposed) setStream((current) => ({ ...current, connection: "live", error: undefined })); };
         source.addEventListener("telemetry", ((message: MessageEvent<string>) => {
+          if (disposed) return;
           try {
             const delta = deltaFrame(JSON.parse(message.data));
             if (!delta) return failFrame();
-            setState((current) => delta.cursor <= current.cursor ? current : {
+            setStream((current) => disposed || delta.cursor <= current.cursor ? current : {
               graph: reduceTelemetry(current.graph, delta.event), cursor: delta.cursor, connection: "live",
             });
           } catch { failFrame(); }
         }) as EventListener);
         source.addEventListener("snapshot", ((message: MessageEvent<string>) => {
+          if (disposed) return;
           try {
             const snapshot = snapshotFrame(JSON.parse(message.data));
             if (!snapshot) return failFrame();
-            setState({ graph: snapshot.state, cursor: snapshot.cursor, connection: "live" });
+            setStream({ graph: snapshot.state, cursor: snapshot.cursor, connection: "live" });
           } catch { failFrame(); }
         }) as EventListener);
-        source.onerror = () => setState((current) => ({ ...current, connection: "offline", error: "Stream disconnected — retrying" }));
+        source.onerror = () => { if (!disposed) setStream((current) => ({ ...current, connection: "offline", error: "Stream disconnected — retrying" })); };
       } catch (error) {
-        if (!disposed) setState((current) => ({ ...current, connection: "offline", error: error instanceof Error ? error.message : "Unable to load snapshot" }));
+        if (!disposed && !(error instanceof DOMException && error.name === "AbortError")) {
+          setStream((current) => ({ ...current, connection: "offline", error: error instanceof Error ? error.message : "Unable to load snapshot" }));
+        }
       }
     };
 
     void load();
-    return () => { disposed = true; source?.close(); };
-  }, []);
+    return () => { disposed = true; controller.abort(); source?.close(); };
+  }, [catalogLoaded, selectedWorkspaceId, selectionState]);
 
-  return state;
+  const selectWorkspace = useCallback((id: string): void => {
+    if (!catalog.workspaces.some((workspace) => workspace.id === id) || id === selectedWorkspaceId) return;
+    setWorkspaceInLocation(id, false);
+    setSelectedWorkspaceId(id);
+    setStream({ graph: createGraphState(), cursor: 0, connection: "connecting" });
+  }, [catalog.workspaces, selectedWorkspaceId]);
+
+  const error = stream.error ?? catalogError;
+  return {
+    ...stream,
+    ...(error !== undefined ? { error } : {}),
+    workspaces: catalog.workspaces,
+    selectedWorkspaceId,
+    selectWorkspace,
+  };
 }
 
 /** The slider addresses at most this many trailing events; a cursor is a position inside that window. */

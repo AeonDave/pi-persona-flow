@@ -1,14 +1,74 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import type { TelemetryEvent } from "../../shared/protocol";
-import { createGraphState, reduceTelemetry } from "../../src/reducer";
-import { agentTitle, computeLayout, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, messageRoute, messageRouteIds, messagesForSelection, modelLabel, rankCanvasTools, shouldAnimateTraffic, siblingColumns, toolOwnerKey, toolsForSelection } from "./App";
+import { createGraphState, fallbackInstance, reduceTelemetry } from "../../src/reducer";
+import App, { agentElapsed, agentTitle, canvasSurfaceSize, computeLayout, connectionPresentation, displayAgentStatus, distinctPeers, formatElapsed, inFlightTraffic, instanceCanvasCaption, instanceOptionLabel, messageRoute, messageRouteIds, messagesForSelection, modelLabel, rankCanvasTools, shouldAnimateTraffic, siblingColumns, toolOwnerKey, toolsForSelection, workspaceOptionLabel } from "./App";
 import { livePresence } from "./state";
 
 const instance = (seq: number, type: "instance.started" | "agent.added", payload: TelemetryEvent["payload"]): TelemetryEvent => ({
   version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: `test-${seq}`, seq, ts: seq * 1000, sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type, payload,
 } as unknown as TelemetryEvent);
 
+const durationEvent = (producerId: string, seq: number, ts: number, type: TelemetryEvent["type"], payload: TelemetryEvent["payload"]): TelemetryEvent => ({
+  version: 2, producerId, producerVersion: "1.10.5", id: `${producerId}-${seq}`, seq, ts, sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type, payload,
+} as unknown as TelemetryEvent);
+
+function runningAgentGraph() {
+  let graph = createGraphState();
+  graph = reduceTelemetry(graph, durationEvent("pi-persona", 1, 1_000, "instance.started", { displayName: "Pi", status: "active" }));
+  graph = reduceTelemetry(graph, durationEvent("pi-persona", 2, 2_000, "agent.added", { id: "worker", label: "Worker", kind: "delegate", status: "running" }));
+  return graph;
+}
+
 describe("control-room layout", () => {
+  it("advances running-agent duration on its owning instance heartbeat", () => {
+    let graph = runningAgentGraph();
+    const key = Object.keys(graph.agents)[0]!;
+    graph = reduceTelemetry(graph, durationEvent("pi-persona", 3, 122_000, "instance.heartbeat", { contextPercent: 3 }));
+
+    expect(agentElapsed(graph, graph.agents[key]!)).toBe(120_000);
+  });
+
+  it("does not use another producer's instance clock for an agent", () => {
+    let graph = runningAgentGraph();
+    const key = Object.keys(graph.agents)[0]!;
+    graph = reduceTelemetry(graph, durationEvent("other-plugin", 1, 999_000, "instance.started", { displayName: "Other", status: "active" }));
+
+    expect(agentElapsed(graph, graph.agents[key]!)).toBe(0);
+  });
+
+  it("pins a terminal agent duration to endedAt despite later owner heartbeats", () => {
+    let graph = runningAgentGraph();
+    const key = Object.keys(graph.agents)[0]!;
+    graph = reduceTelemetry(graph, durationEvent("pi-persona", 3, 72_000, "agent.updated", { id: "worker", patch: { status: "done" } }));
+    graph = reduceTelemetry(graph, durationEvent("pi-persona", 4, 500_000, "instance.heartbeat", { contextPercent: 4 }));
+
+    expect(agentElapsed(graph, graph.agents[key]!)).toBe(70_000);
+  });
+
+  it("keeps replay-prefix duration frozen while later owner signals advance live duration", () => {
+    const prefix = runningAgentGraph();
+    const key = Object.keys(prefix.agents)[0]!;
+    const later = reduceTelemetry(prefix, durationEvent("pi-persona", 3, 122_000, "instance.heartbeat", { contextPercent: 3 }));
+
+    expect(agentElapsed(prefix, prefix.agents[key]!)).toBe(0);
+    expect(agentElapsed(later, later.agents[key]!)).toBe(120_000);
+  });
+
+  it("gives both scope filters accessible names in the rendered control room", () => {
+    const previousDevicePixelRatio = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
+    Object.defineProperty(globalThis, "devicePixelRatio", { configurable: true, value: 1 });
+    try {
+      const markup = renderToStaticMarkup(createElement(App));
+      expect(markup).toMatch(/<select\b[^>]*\baria-label="Instance"/);
+      expect(markup).toMatch(/<select\b[^>]*\baria-label="Persona"/);
+    } finally {
+      if (previousDevicePixelRatio) Object.defineProperty(globalThis, "devicePixelRatio", previousDevicePixelRatio);
+      else Reflect.deleteProperty(globalThis, "devicePixelRatio");
+    }
+  });
+
   it("renders presence-only exocom peers as selectable external nodes", () => {
     const graph = reduceTelemetry(createGraphState(), {
       version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "peer-1", seq: 1, ts: 1000, sessionId: "alpha", workspaceId: "0123456789abcdef01234567",
@@ -16,6 +76,93 @@ describe("control-room layout", () => {
     } as unknown as TelemetryEvent);
     const layout = computeLayout(graph, 900, 600);
     expect(layout.rects.some((rect) => rect.entity.type === "peer" && rect.entity.key === "pi-persona::alpha::remote")).toBe(true);
+  });
+
+  it("sizes a short viewport to keep ten Pi instances and their card geometry reachable", () => {
+    let graph = createGraphState();
+    for (let index = 0; index < 10; index += 1) {
+      graph = reduceTelemetry(graph, {
+        version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: `instance-${index}`, seq: 1,
+        ts: 1000, sessionId: `session-${index}`, workspaceId: "0123456789abcdef01234567",
+        type: "instance.started", payload: { displayName: `Pi ${index}`, status: "active" },
+      } as unknown as TelemetryEvent);
+    }
+
+    const layout = computeLayout(graph, 900, 360);
+    const instances = layout.rects.filter((rect) => rect.entity.type === "instance");
+    expect(instances).toHaveLength(10);
+    expect(layout.height).toBeGreaterThan(360);
+    expect(layout.rects.every((rect) => rect.y >= 0 && rect.y + rect.height <= layout.height)).toBe(true);
+    // GraphCanvas uses the instance node's y minus 54 as its card top and clips the card 22px
+    // before the canvas edge. A content-sized layout must leave that calculation non-negative.
+    expect(instances.every((rect) => layout.height - (rect.y - 54) - 22 >= 0)).toBe(true);
+  });
+
+  it("keeps CSS canvas node dimensions equal at DPR 1 and 2", () => {
+    const graph = reduceTelemetry(createGraphState(), instance(1, "instance.started", {
+      displayName: "Alpha", status: "active",
+    }));
+    const layout = computeLayout(graph, 900, 360);
+    const node = layout.rects.find((rect) => rect.entity.type === "instance")!;
+    const one = canvasSurfaceSize(layout.width, layout.height, 1);
+    const two = canvasSurfaceSize(layout.width, layout.height, 2);
+    const cssNodeHeightAtOne = node.height / layout.height * one.cssHeight;
+    const cssNodeHeightAtTwo = node.height / layout.height * two.cssHeight;
+
+    expect(one.pixelHeight).toBe(layout.height);
+    expect(two.pixelHeight).toBe(layout.height * 2);
+    expect(cssNodeHeightAtOne).toBe(cssNodeHeightAtTwo);
+  });
+
+  it("wraps ten external peers within a short canvas and extends its content height", () => {
+    let graph = reduceTelemetry(createGraphState(), instance(1, "instance.started", {
+      displayName: "Alpha", status: "active",
+    }));
+    graph = reduceTelemetry(graph, {
+      version: 2, producerId: "pi-persona", producerVersion: "1.10.5", id: "peers-alpha", seq: 2,
+      ts: 2000, sessionId: "alpha", workspaceId: "0123456789abcdef01234567", type: "peers.snapshot",
+      payload: { peers: Array.from({ length: 10 }, (_, index) => ({
+        sessionId: `remote-${index}`, displayName: `Remote Pi ${index}`, status: "active", sent: 0, received: 0,
+      })) },
+    } as unknown as TelemetryEvent);
+
+    const layout = computeLayout(graph, 320, 360);
+    const peers = layout.rects.filter((rect) => rect.entity.type === "peer");
+    expect(peers).toHaveLength(10);
+    expect(new Set(peers.map((peer) => peer.y)).size).toBeGreaterThan(1);
+    expect(layout.height).toBeGreaterThan(360);
+    expect(peers.every((peer) => peer.x >= 0 && peer.x + peer.width <= layout.width && peer.y >= 0 && peer.y + peer.height <= layout.height)).toBe(true);
+  });
+
+  it("disambiguates duplicate instance names with the producer and session identity", () => {
+    const alpha = { ...fallbackInstance("pi-persona", "same", 1000), displayName: "Pi" };
+    const beta = { ...fallbackInstance("other.plugin", "same", 1000), displayName: "Pi" };
+    const instances = [alpha, beta];
+
+    expect(instanceOptionLabel(alpha, instances)).toBe("Pi · pi-persona/same");
+    expect(instanceOptionLabel(beta, instances)).toBe("Pi · other.plugin/same");
+    const unique = { ...fallbackInstance("pi-persona", "unique", 1000), displayName: "Solo" };
+    expect(instanceOptionLabel(unique, [unique])).toBe("Solo");
+  });
+
+  it("shows an Exocom shelf label only when the instance advertises it enabled", () => {
+    expect(instanceCanvasCaption({ exocomEnabled: true })).toBe("PI INSTANCE / EXOCOM");
+    expect(instanceCanvasCaption({ exocomEnabled: false })).toBe("PI INSTANCE");
+    expect(instanceCanvasCaption(undefined)).toBe("PI INSTANCE");
+  });
+
+  it("disambiguates duplicate workspace labels and shows active-session counts", () => {
+    const alpha = { id: "workspace-a", label: "Shared", activeSessions: 2, lastSeenAt: 1000 };
+    const beta = { id: "workspace-b", label: "Shared", activeSessions: 0, lastSeenAt: 2000 };
+    expect(workspaceOptionLabel(alpha, [alpha, beta])).toBe("Shared · workspace-a · 2 active sessions");
+    expect(workspaceOptionLabel(beta, [alpha, beta])).toBe("Shared · workspace-b · 0 active sessions");
+    expect(workspaceOptionLabel({ ...alpha, label: "Unique" }, [{ ...alpha, label: "Unique" }])).toBe("Unique · 2 active sessions");
+  });
+
+  it("labels and colors the dashboard connection from its actual state", () => {
+    expect(connectionPresentation("live")).toEqual({ label: "LIVE", className: "connection-live", dotClassName: "status-live" });
+    expect(connectionPresentation("connecting")).toEqual({ label: "CONNECTING", className: "connection-connecting", dotClassName: "status-connecting" });
+    expect(connectionPresentation("offline")).toEqual({ label: "OFFLINE", className: "connection-offline", dotClassName: "status-offline" });
   });
 
   it("keeps instance and nested agent placement deterministic", () => {

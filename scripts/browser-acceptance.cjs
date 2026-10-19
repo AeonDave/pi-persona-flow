@@ -18,12 +18,12 @@ async (page) => {
   if (!(await inspector.getByRole("heading", { name: "Dewglass", exact: true }).isVisible())) throw new Error("worker alias not shown");
   const route = inspector.locator('[title="scout → supervisor"]');
   if ((await route.innerText()) !== "OUT → Alpha") throw new Error("route aliases or direction incorrect");
-  await page.getByRole("button", { name: /^instance Alpha,/ }).click();
+  await page.getByRole("button", { name: /^instance Alpha,/ }).first().click();
   if (!(await inspector.getByText("OUT → Remote", { exact: true }).isVisible())) throw new Error("exocom alias not shown");
   const text = await page.locator("body").innerText();
   if (/CANARY|cat \/etc\/shadow/.test(text)) throw new Error("unsafe payload reached DOM");
   await page.getByRole("button", { name: "REVIEW", exact: true }).click();
-  await page.getByRole("slider", { name: "Replay event position" }).press("Home");
+  await page.getByRole("slider", { name: "Replay event position in recorded order", exact: true }).press("Home");
   await page.getByRole("button", { name: "Play replay", exact: true }).click();
   await page.getByRole("button", { name: "Pause replay", exact: true }).click();
   await page.getByRole("button", { name: "Return to live", exact: true }).click();

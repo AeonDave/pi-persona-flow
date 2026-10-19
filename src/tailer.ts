@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import * as path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 import { parseTelemetryEvent } from "../shared/protocol.ts";
 import { EventStore } from "./event-store.ts";
@@ -102,7 +102,10 @@ export class TelemetryTailer {
     this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
     if (!Number.isFinite(this.retentionMs) || this.retentionMs < 1) throw new RangeError("retentionMs must be positive");
     this.onError = options.onError;
-    const agentDir = options.agentDir ?? getAgentDir();
+    // The detached viewer service runs under native Node, not inside Pi. Keep the producer's
+    // override order without importing the host package: the Pi adapter passes the canonical path,
+    // and direct/test callers fall back to the same env names and default profile directory.
+    const agentDir = options.agentDir ?? (process.env.PI_AGENT_DIR || process.env.PI_CODING_AGENT_DIR || path.join(homedir(), ".pi", "agent"));
     const cwdHash = options.cwd ? workspaceHash(options.cwd) : options.workspaceId;
     if (cwdHash !== options.workspaceId) throw new Error("workspaceId does not match cwd");
     this.directory = path.join(agentDir, "pi-persona", "flow", options.workspaceId);

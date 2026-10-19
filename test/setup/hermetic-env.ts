@@ -4,8 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 for (const key of Object.keys(process.env)) {
-	if (key.toUpperCase() === "PI_AGENT_DIR" || key.toUpperCase().startsWith("PI_PERSONA_")) delete process.env[key];
+	if (["PI_AGENT_DIR", "PI_CODING_AGENT_DIR"].includes(key.toUpperCase()) || key.toUpperCase().startsWith("PI_PERSONA_")) delete process.env[key];
 }
 const agentDir = mkdtempSync(join(tmpdir(), "pi-flow-test-agent-"));
 process.env.PI_AGENT_DIR = agentDir;
+process.env.PI_CODING_AGENT_DIR = agentDir;
 process.once("exit", () => rmSync(agentDir, { recursive: true, force: true }));

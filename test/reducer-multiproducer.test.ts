@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { createGraphState, entityKey, markStale, MAX_INACTIVE_STREAMS, MAX_STREAMS, reduceTelemetry } from "../src/reducer.ts";
-import { TELEMETRY_VERSION, type TelemetryEvent, type TelemetryEventType } from "../shared/protocol.ts";
+import { parseTelemetryEvent, TELEMETRY_VERSION, type TelemetryEvent, type TelemetryEventType } from "../shared/protocol.ts";
 
 function event<T extends TelemetryEventType>(producerId: string, type: T, payload: Extract<TelemetryEvent, { type: T }>['payload'], seq = 1, sessionId = "s"): TelemetryEvent {
   return { version: TELEMETRY_VERSION, producerId, producerVersion: "1.0.0", id: `${producerId}:${sessionId}:${seq}`, seq, ts: seq, sessionId, workspaceId: "0123456789abcdef01234567", type, payload } as unknown as TelemetryEvent;
@@ -48,6 +48,39 @@ test("canonical exocom endpoints resolve to the reporter-scoped peer key", () =>
   assert.equal(state.messages[0]?.fromKey, entityKey("a", "s"));
   assert.equal(state.messages.length, 1, "the current graph coalesces lifecycle updates for one logical message");
   assert.equal(state.messages[0]?.status, "delivered");
+});
+
+test("Exocom terminal receipt enriches one stable message row and resolves incoming replyTo", () => {
+  const queued = parseTelemetryEvent(event("pi-persona", "message.sent", {
+    id: "tool-call-1", channel: "exocom", from: "sender-session", to: "peer-session",
+    kind: "message", status: "queued", expectsReply: false, size: 5, replyTo: "wire-in",
+  }, 1, "sender-session"));
+  const delivered = parseTelemetryEvent(event("pi-persona", "message.sent", {
+    id: "tool-call-1", channel: "exocom", from: "sender-session", to: "peer-session",
+    kind: "message", status: "delivered", expectsReply: false, size: 5, replyTo: "wire-in", wireId: "wire-out",
+  }, 2, "sender-session"));
+  const receivedReply = parseTelemetryEvent(event("pi-persona", "message.received", {
+    id: "wire-reply", channel: "exocom", from: "peer-session", to: "sender-session",
+    kind: "message", status: "delivered", expectsReply: false, size: 4, replyTo: "wire-out",
+  }, 1, "peer-session"));
+  assert.ok(queued);
+  assert.ok(delivered);
+  assert.ok(receivedReply);
+
+  let state = createGraphState();
+  state = reduceTelemetry(state, queued);
+  state = reduceTelemetry(state, delivered);
+  state = reduceTelemetry(state, receivedReply);
+
+  const outgoing = state.messages.filter((message) =>
+    message.producerId === "pi-persona" && message.sessionId === "sender-session" && message.id === "tool-call-1",
+  );
+  assert.equal(outgoing.length, 1, "the terminal event updates the queued row instead of creating another card");
+  assert.equal(outgoing[0]?.status, "delivered");
+  assert.equal(outgoing[0]?.wireId, "wire-out");
+  assert.equal(outgoing[0]?.replyTo, "wire-in");
+  const incoming = state.messages.find((message) => message.sessionId === "peer-session" && message.id === "wire-reply");
+  assert.equal(incoming?.replyTo, outgoing[0]?.wireId, "the received reply points at the sender's wire correlation id");
 });
 
 test("terminal stream retention is bounded without evicting an active instance", () => {

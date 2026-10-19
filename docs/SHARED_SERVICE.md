@@ -1,0 +1,110 @@
+# Shared local dashboard service
+
+- Status: accepted
+- Date: 2026-10-19
+
+## Outcome and boundaries
+
+One already-open browser page discovers newly opened Pi workspaces and can switch among their
+sessions and workflows. Ten concurrent Pi clients share one local service rather than ten listeners
+and duplicate scans. Ending the first Pi must not end the other clients' dashboard.
+
+The service is per canonical agent directory (one user/profile), not a system-wide Windows/systemd
+installation. It is a detached Node process, launched lazily by the extension. No runtime dependency
+on Pi or tsx is allowed in that process: the source uses Node 22.19+ native erasable TypeScript.
+Node-only modules own HTTP, files, stores and leases; Pi lifecycle/UI stays in `src/extension.ts`.
+Keep Pi 1.0 minimum-host tests and separately qualify installed Pi 1.3.
+
+## Contracts
+
+`shared/workspaces.ts` is the shared type boundary. Private registration includes cwd, workspace hash,
+Pi session ID, a per-attachment random client ID and PID. The workspace ID remains `workspaceHash(cwd)`
+from the existing producer contract; the label is a bounded basename, not an absolute path. Canonical
+agent-dir resolution happens in the Pi adapter (`PI_AGENT_DIR || getAgentDir()`) and is passed to the
+service. It never accepts an arbitrary agent directory from a browser request.
+
+- `GET /api/workspaces`: browser-authenticated `WorkspaceCatalog`, no paths/control secrets.
+- `GET /api/snapshot?workspace=<id>`: only that workspace's EventStore and cursor.
+- `GET /api/stream?workspace=<id>&after=<cursor>`: only that workspace's snapshots/deltas.
+- A missing workspace parameter uses the catalog default; an unknown explicit ID returns 404,
+  never another workspace's data. Existing single-store server adapters expose one `local` workspace.
+- `GET /internal/status`: private control authentication, returns `{ protocol: 1, serviceId }`.
+- `POST /internal/register`: body `WorkspaceRegistration`, returns `{ workspaceId }`.
+- `POST /internal/heartbeat`: body `{ clientId }`; unknown registration returns 404.
+- `POST /internal/unregister`: body `{ clientId }`, idempotent.
+- `POST /internal/ingest`: body `{ clientId, events }`; independently validate each event and reject
+  foreign-workspace data. This forwards compatible bus-only producers as well as immediate file
+  duplicates; EventStore deduplication remains authoritative. This route alone permits a bounded
+  2 MiB body (ordinary private control bodies remain limited to 16 KiB).
+
+Private routes require `x-pi-flow-control` with a random 256-bit token, reject browser Origin headers,
+bound JSON bodies (16 KiB) and bind only to 127.0.0.1. Browser read-only routes retain the existing
+four-character convenience gate and per-port cookie. Never expose the private descriptor or token
+in browser responses, public URLs, telemetry, or logs. No wildcard CORS.
+
+`<agentDir>/persona-flow/service-v1/service.json` is a private atomic 0600 descriptor:
+protocol, service ID/nonce, PID, browser URL, control token and start time. An authenticated status
+probe verifies the descriptor, not PID existence alone. Startup contenders share an exclusive
+`startup.lock` owned by PID+nonce; only a proven-dead owner can be reclaimed. Unknown/malformed
+owners fail closed with a bounded actionable diagnostic. No broad process killing or deletion.
+
+The secondary `startup.lock.reclaim` guard is deliberately conservative after a crash: an unknown,
+malformed or proven-dead reclaimer fails closed rather than risking deletion of a new contender's
+lock. After confirming no Flow daemon or live Pi owns the profile, an operator may remove only that
+stale reclaim file and retry. Never remove a live owner's lock or the whole profile directory.
+
+The service entrypoint `src/service/entry.ts` accepts absolute agent-dir and desired-port arguments,
+creates its own service ID/control token and descriptor, and owns descriptor cleanup on shutdown.
+The client launcher holds the startup lock until that descriptor authenticates. Spawn detached with
+hidden Windows window, ignored stdio and an error listener. A failed/cancelled attachment cannot
+register after cancellation; an already-started shared service can exit through its idle lifecycle.
+
+Backend API: `startSharedService({ agentDir, port, ...testLimits })` resolves a descriptor plus
+`close()` and `clientCount()`; it starts one multiplexing HTTP server. The entrypoint persists the
+descriptor and awaits the service lifecycle. Client API:
+`connectFlowService({ agentDir, cwd, sessionId, port?, signal? })` returns
+`{ url, workspaceId, heartbeat(): Promise<void>, publish(events: readonly unknown[]): Promise<void>, close(): Promise<void> }`.
+Close unregisters only that client, never kills the shared service. A 404 heartbeat re-registers a
+still-live attachment. Transport failures are non-fatal to Pi, but visible and bounded.
+The Pi adapter batches bus delivery behind one in-flight request, bounds its queue by count/bytes,
+and retries an ambiguous delivery once with identical event IDs (safe under service deduplication).
+Shutdown drains the final bounded batch before unregistering. Exhausted delivery/overload is visible
+instead of growing without limit or claiming guaranteed delivery. Session generations discard late
+callbacks. Compatible bus-only producers should persist their own history if durable recovery matters.
+
+## Lifetime and data
+
+The service uses one EventStore/Tailer per registered workspace, with exact workspace filtering.
+It aggregates compatible workspace logs, as before; Exocom membership never broadens filesystem
+scope. `--no-flow` prevents this run from starting/registering with the viewer; it does not disable
+producer telemetry or hide workspace logs from another enabled viewer. Producer opt-outs are separate.
+Dedicated worker markers skip Flow registration. A user-set `PI_PERSONA_DISABLE` is not a worker.
+
+Clients heartbeat every 5 seconds; a 20-second lease expires crashed/disconnected clients. PID checks
+are conservative (`ESRCH` proves death, permission/unknown does not). SDK sessions in the same process
+have separate client IDs. Unregistering or expiry updates workspace active counts immediately;
+recent workspace history remains navigable in the service's bounded lifetime. Cap retained workspace
+stores (32) and active client registrations (256), never evict an active workspace, reject excess
+active registrations clearly, and retire
+inactive stores first. Existing EventStore bounds remain in force per workspace.
+
+With no registrations and no browser SSE clients, idle shutdown occurs after 60 seconds. An open
+browser may continue reviewing recorded work. No automatic browser-tab spawning is added: open the
+shared page once with `/dashboard`, then leave it connected. `/dashboard stop` detaches this run only;
+`serve` reattaches it unless `--no-flow` was supplied. `/dashboard status` prints the shared URL.
+
+The browser polls the small catalog every 2 seconds, preserves a valid workspace URL selection,
+and resets graph, filters, replay, selection and cursor on switching. Abort previous snapshot requests,
+close the old EventSource and ignore late callbacks; identical producer/session IDs in two workspaces
+must never mix. Use `useDashboard` fields `workspaces`, `selectedWorkspaceId`, `selectWorkspace(id)`.
+
+## Alternatives and verification
+
+Per-Pi listeners were simple and isolated but multiply discovery/scans and URLs. Hosting inside the
+first Pi makes shared lifetime depend on that process. A separate service adds startup election,
+private control authentication and crash recovery, justified by the requested multi-workspace use.
+
+Prove singleton startup across concurrent processes, distinct workspace/cursor isolation, service
+survival after its first client exits, crash/lease recovery, opt-out, shutdown and packed native-Node
+execution without development dependencies. Then exercise workspace discovery/switching in Playwright,
+including late responses, reused IDs, empty/offline states, mobile layout and no idle animation loop.

@@ -7,6 +7,7 @@ import {
   createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime,
   SessionManager, SettingsManager, VERSION, type AgentSession, type ExtensionFactory, type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
+import { waitForServiceIdle } from "./service-cleanup.ts";
 
 export async function runtimeHarness(root: string, extensionPath: string, factories: ExtensionFactory[] = []) {
   assert.equal(VERSION, "1.0.0", "run against the actual minimum supported host");
@@ -15,10 +16,18 @@ export async function runtimeHarness(root: string, extensionPath: string, factor
   await mkdir(cwd, { recursive: true });
   await mkdir(agentDir, { recursive: true });
   const previousAgentDir = process.env.PI_AGENT_DIR;
+  const previousHostAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousIdle = process.env.PI_PERSONA_FLOW_IDLE_MS;
   process.env.PI_AGENT_DIR = agentDir;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.PI_PERSONA_FLOW_IDLE_MS = "1500";
   const restoreEnvironment = () => {
     if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
     else process.env.PI_AGENT_DIR = previousAgentDir;
+    if (previousHostAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousHostAgentDir;
+    if (previousIdle === undefined) delete process.env.PI_PERSONA_FLOW_IDLE_MS;
+    else process.env.PI_PERSONA_FLOW_IDLE_MS = previousIdle;
   };
   let createdSession: AgentSession | undefined;
   try {
@@ -72,7 +81,7 @@ export async function runtimeHarness(root: string, extensionPath: string, factor
           try { await session.abort(); }
           finally {
             try { session.dispose(); }
-            finally { restoreEnvironment(); }
+            finally { try { await waitForServiceIdle(agentDir); } finally { restoreEnvironment(); } }
           }
         }
       },

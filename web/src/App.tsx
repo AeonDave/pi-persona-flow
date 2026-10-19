@@ -4,9 +4,10 @@ import {
   Activity, AlertTriangle, Bot, ChevronRight, CircleDot, Clock3, Command, Layers3, Pause, Play,
   Radio, RotateCcw, Search, Server, Sparkles, Terminal, Wifi, X,
 } from "lucide-react";
-import { entityKey, type AgentView, type GraphState, type MessageView, type ToolView } from "../../src/reducer";
+import { entityKey, type AgentView, type GraphState, type InstanceView, type MessageView, type ToolView } from "../../src/reducer";
 import type { MessageChannel, MessageStatus, TelemetryEvent } from "../../shared/protocol";
-import { attentionGraph, eventLabel, livePresence, liveStream, needsAttention, reconcileFilters, useDashboard, useFilteredGraph, useTimelineView, type Filters } from "./state";
+import type { WorkspaceSummary } from "../../shared/workspaces";
+import { attentionGraph, eventLabel, livePresence, liveStream, needsAttention, reconcileFilters, useDashboard, useFilteredGraph, useTimelineView, type ConnectionState, type Filters } from "./state";
 
 export type EntityId = { type: "instance" | "agent" | "peer" | "tool"; key: string };
 type Point = { x: number; y: number };
@@ -21,6 +22,16 @@ type LayoutChannel = "hierarchy" | "intercom" | "exocom" | "other";
 type Layout = { rects: Rect[]; links: Array<{ from: Point; to: Point; channel: LayoutChannel; active: boolean }>; width: number; height: number };
 
 const COLORS = { cyan: "#65e8f4", magenta: "#f083d7", violet: "#a78bfa", amber: "#f7b955", green: "#6ee7a4", red: "#fb7185", muted: "#607b86" };
+const CANVAS_MONO_FONT = 'ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace';
+
+export function canvasSurfaceSize(width: number, height: number, devicePixelRatio: number): { cssWidth: number; cssHeight: number; pixelWidth: number; pixelHeight: number; scale: number } {
+  const scale = Number.isFinite(devicePixelRatio) && devicePixelRatio > 0 ? devicePixelRatio : 1;
+  return { cssWidth: width, cssHeight: height, pixelWidth: Math.round(width * scale), pixelHeight: Math.round(height * scale), scale };
+}
+
+export function connectionPresentation(connection: ConnectionState): { label: string; className: string; dotClassName: string } {
+  return { label: connection.toUpperCase(), className: `connection-${connection}`, dotClassName: `status-${connection}` };
+}
 
 function statusColor(status: string): string {
   if (["failed", "stale"].includes(status)) return COLORS.red;
@@ -40,14 +51,28 @@ export function shouldAnimateTraffic(status: MessageStatus | string, reducedMoti
 
 /** Intercom endpoints are `producer::session::agentId`; the instance card is `producer::session`.
  *  Matching only the exact key left the instance inspector empty for the traffic it owns. */
+function messageBelongsToSelection(message: MessageView, selected: EntityId): boolean {
+  if (message.fromKey === selected.key || message.toKey === selected.key) return true;
+  if (selected.type !== "instance") return false;
+  if (entityKey(message.producerId, message.sessionId) === selected.key) return true;
+  const nested = `${selected.key}::`;
+  return message.fromKey.startsWith(nested) || message.toKey.startsWith(nested);
+}
+
 export function messagesForSelection(messages: readonly MessageView[], selected: EntityId): MessageView[] {
-  return messages.filter((message) => {
-    if (message.fromKey === selected.key || message.toKey === selected.key) return true;
-    if (selected.type !== "instance") return false;
-    if (entityKey(message.producerId, message.sessionId) === selected.key) return true;
-    const nested = `${selected.key}::`;
-    return message.fromKey.startsWith(nested) || message.toKey.startsWith(nested);
-  }).slice(-5).reverse();
+  return messages.filter((message) => messageBelongsToSelection(message, selected)).reverse();
+}
+
+export function messageCountForSelection(messages: readonly MessageView[], selected: EntityId): number {
+  return messages.filter((message) => messageBelongsToSelection(message, selected)).length;
+}
+
+function messageTraceMetadata(message: MessageView): string | undefined {
+  const fields = [
+    message.wireId ? `Wire ID: ${message.wireId}` : undefined,
+    message.replyTo ? `Reply to: ${message.replyTo}` : undefined,
+  ].filter((field): field is string => field !== undefined);
+  return fields.length > 0 ? fields.join("\n") : undefined;
 }
 
 function messageEndpointAgent(message: MessageView, endpoint: string, graph: GraphState): AgentView | undefined {
@@ -147,6 +172,16 @@ export function formatElapsed(ms: number): string {
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
   return rest ? `${hours}h ${rest}m` : `${hours}h`;
+}
+
+/** A running worker has no heartbeat of its own: its owning Pi instance heartbeat is the freshest
+ *  clock available. Keep this derived from the supplied graph so replay prefixes remain frozen and
+ *  never borrow timestamps from another producer/session or from the wall clock. */
+export function agentElapsed(graph: GraphState, agent: AgentView): number {
+  if (agent.endedAt !== undefined) return Math.max(0, agent.endedAt - agent.startedAt);
+  const owner = graph.instances[entityKey(agent.producerId, agent.sessionId)];
+  const latestSignal = Math.max(agent.startedAt, agent.updatedAt, owner?.updatedAt ?? agent.startedAt);
+  return Math.max(0, latestSignal - agent.startedAt);
 }
 
 function summaryLine(model: string | undefined, stats: { total: number; failed: number; running: number }, exocomEnabled = false): string {
@@ -265,6 +300,45 @@ export function distinctPeers(graph: GraphState): number {
   return new Set(Object.keys(graph.peers).map((key) => key.slice(key.lastIndexOf("::") + 2))).size;
 }
 
+/** Display aliases are not identities: disambiguate collisions using the preserved stream key parts. */
+export function instanceOptionLabel(instance: InstanceView, instances: readonly InstanceView[]): string {
+  const duplicated = instances.some((other) => other !== instance && other.displayName === instance.displayName);
+  return duplicated ? `${instance.displayName} · ${instance.producerId}/${instance.sessionId}` : instance.displayName;
+}
+
+export function instanceCanvasCaption(instance: Pick<InstanceView, "exocomEnabled"> | undefined): string {
+  return instance?.exocomEnabled ? "PI INSTANCE / EXOCOM" : "PI INSTANCE";
+}
+
+export function workspaceOptionLabel(workspace: WorkspaceSummary, workspaces: readonly WorkspaceSummary[]): string {
+  const duplicated = workspaces.some((other) => other.id !== workspace.id && other.label === workspace.label);
+  const identity = duplicated ? ` · ${workspace.id}` : "";
+  const sessions = workspace.activeSessions;
+  return `${workspace.label}${identity} · ${sessions} active session${sessions === 1 ? "" : "s"}`;
+}
+
+const EMPTY_FILTERS: Filters = { instance: "", persona: "", channel: "all", attention: "all" };
+
+/** Filters and replay positions belong to a selected workspace, never to a reused producer/session key. */
+export function useWorkspaceViewState(workspaceId: string) {
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [selected, setSelected] = useState<EntityId>();
+  const [playing, setPlaying] = useState(false);
+  const [cursor, setCursor] = useState<number>();
+  const previousWorkspace = useRef(workspaceId);
+
+  useEffect(() => {
+    if (previousWorkspace.current === workspaceId) return;
+    previousWorkspace.current = workspaceId;
+    setFilters(EMPTY_FILTERS);
+    setSelected(undefined);
+    setPlaying(false);
+    setCursor(undefined);
+  }, [workspaceId]);
+
+  return { filters, setFilters, selected, setSelected, playing, setPlaying, cursor, setCursor };
+}
+
 export function computeLayout(graph: GraphState, width: number, height: number): Layout {
   const instances = Object.entries(graph.instances).filter(([, instance]) => liveStream(instance.status)).sort(([a], [b]) => a.localeCompare(b));
   const rects: Rect[] = [];
@@ -275,7 +349,7 @@ export function computeLayout(graph: GraphState, width: number, height: number):
   const cardWidth = (width - pad * 2 - gap * (cols - 1)) / cols;
   let cardY = pad;
   for (let rowStart = 0; rowStart < instances.length; rowStart += cols) {
-    let rowBottom = cardY + 270;
+    let rowBottom = cardY;
     const instanceRow = instances.slice(rowStart, rowStart + cols);
     instanceRow.forEach(([sessionId, instance], col) => {
     const cardX = pad + col * (cardWidth + gap);
@@ -329,7 +403,7 @@ export function computeLayout(graph: GraphState, width: number, height: number):
             height: AGENT_BODY + (chips.visible.length > 0 ? CHIP_STRIP : 0),
             entity: { type: "agent", key: agent.key }, streamKey: sessionId, color: statusColor(shown),
             label: agentTitle(agent.label, agent.model), status: shown,
-            span: formatElapsed((agent.endedAt ?? agent.updatedAt) - agent.startedAt),
+            span: formatElapsed(agentElapsed(graph, agent)),
             detail: summaryLine(agent.model, stats),
           };
           rects.push(rect);
@@ -362,16 +436,24 @@ export function computeLayout(graph: GraphState, width: number, height: number):
       drawnSessions.add(observed);
       return true;
     });
+  const peerGap = 10;
+  const peerHeight = 30;
+  const innerWidth = Math.max(1, width - pad * 2);
+  const peerColumns = Math.max(1, Math.floor((innerWidth + peerGap) / (112 + peerGap)));
+  const peerWidth = Math.min(154, Math.max(1, (innerWidth - peerGap * (peerColumns - 1)) / peerColumns));
+  const peerRows = Math.ceil(peers.length / peerColumns);
+  const peerShelfHeight = peerRows > 0 ? peerRows * peerHeight + (peerRows - 1) * peerGap : 0;
+  const peerY = peers.length > 0 ? Math.max(8, height - peerShelfHeight - 14, cardY + 14) : 0;
   if (peers.length > 0) {
-    const peerGap = 10;
-    const peerWidth = Math.min(154, Math.max(112, (width - pad * 2 - (peers.length - 1) * peerGap) / peers.length));
-    // External peers live on a right-aligned shelf. Centering a lone peer made its exocom edge cut
-    // through the common odd-instance card in the lower-left column and read as a false attachment.
-    const peerStart = Math.max(pad, width - pad - (peerWidth * peers.length + peerGap * (peers.length - 1)));
-    const peerY = Math.max(8, height - 44);
+    // Right-align each shelf row. Wrapping keeps foreign peers reachable on short/narrow canvases
+    // while preserving the detached Exocom shelf rather than implying hierarchy.
     peers.forEach(([sessionId, peer], index) => {
+      const row = Math.floor(index / peerColumns);
+      const column = index % peerColumns;
+      const peersInRow = Math.min(peerColumns, peers.length - row * peerColumns);
+      const peerStart = width - pad - (peerWidth * peersInRow + peerGap * (peersInRow - 1));
       rects.push({
-        x: peerStart + index * (peerWidth + peerGap), y: peerY, width: peerWidth, height: 30,
+        x: peerStart + column * (peerWidth + peerGap), y: peerY + row * (peerHeight + peerGap), width: peerWidth, height: peerHeight,
         entity: { type: "peer", key: sessionId }, color: peer.color ?? COLORS.magenta,
         label: peer.displayName, status: peer.status,
       });
@@ -403,21 +485,25 @@ export function computeLayout(graph: GraphState, width: number, height: number):
     else if (active) existing.active = true;
   }
   links.push(...channelLinks.values());
-  return { rects, links, width, height };
+  const peerBottom = peerY + peerRows * (peerHeight + peerGap) - peerGap;
+  const contentHeight = Math.max(height, cardY + pad, peers.length > 0 ? peerBottom + pad : 0);
+  return { rects, links, width, height: contentHeight };
 }
 
 function GraphCanvas({ graph, selected, onSelect }: { graph: GraphState; selected?: EntityId; onSelect: (entity: EntityId) => void }): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewportRef = useRef<HTMLDivElement>(null);
   const frameRef = useRef({ pulse: 0, layout: undefined as Layout | undefined });
   const [size, setSize] = useState({ width: 900, height: 600 });
   const [reducedMotion, setReducedMotion] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const layout = useMemo(() => computeLayout(graph, size.width, size.height), [graph, size]);
+  const surface = canvasSurfaceSize(layout.width, layout.height, devicePixelRatio);
   frameRef.current.layout = layout;
 
   useEffect(() => {
-    const canvas = canvasRef.current; if (!canvas) return;
-    const observer = new ResizeObserver(() => { const bounds = canvas.getBoundingClientRect(); setSize({ width: Math.max(500, Math.floor(bounds.width * devicePixelRatio)), height: Math.max(360, Math.floor(bounds.height * devicePixelRatio)) }); });
-    observer.observe(canvas); return () => observer.disconnect();
+    const viewport = viewportRef.current; if (!viewport) return;
+    const observer = new ResizeObserver(() => { const bounds = viewport.getBoundingClientRect(); setSize({ width: Math.max(320, Math.floor(bounds.width)), height: Math.max(360, Math.floor(bounds.height)) }); });
+    observer.observe(viewport); return () => observer.disconnect();
   }, []);
   useEffect(() => {
     const media = window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -433,8 +519,8 @@ function GraphCanvas({ graph, selected, onSelect }: { graph: GraphState; selecte
       const liveTraffic = current.links.some((link) => link.channel !== "hierarchy" && link.active);
       const animatedTraffic = liveTraffic && !reducedMotion;
       if (animatedTraffic) frameRef.current.pulse = (frameRef.current.pulse + 0.018) % (Math.PI * 2);
-      ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.save();
-      ctx.scale(devicePixelRatio, devicePixelRatio); const scaleX = size.width / devicePixelRatio / current.width; const scaleY = size.height / devicePixelRatio / current.height; ctx.scale(scaleX, scaleY);
+      ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.save();
+      ctx.scale(surface.scale, surface.scale);
       ctx.fillStyle = "#081218"; ctx.fillRect(0, 0, current.width, current.height);
       ctx.strokeStyle = "rgba(105, 168, 179, .055)"; ctx.lineWidth = 1;
       for (let x = 0; x < current.width; x += 32) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, current.height); ctx.stroke(); }
@@ -460,71 +546,80 @@ function GraphCanvas({ graph, selected, onSelect }: { graph: GraphState; selecte
         if (chip) {
           rounded(ctx, rect.x, rect.y, rect.width, rect.height, 4); ctx.fill(); ctx.stroke();
           ctx.fillStyle = rect.color; ctx.beginPath(); ctx.arc(rect.x + 7, rect.y + rect.height / 2, 2.5, 0, Math.PI * 2); ctx.fill();
-          ctx.fillStyle = "#d5e6e8"; ctx.font = "8px ui-monospace, monospace";
+          ctx.fillStyle = "#d5e6e8"; ctx.font = `8px ${CANVAS_MONO_FONT}`;
           ctx.fillText(short(rect.label, Math.max(4, Math.floor((rect.width - 16) / 5))), rect.x + 12, rect.y + rect.height / 2 + 3);
           return;
         }
         rounded(ctx, rect.x, rect.y, rect.width, rect.height, 8); ctx.fill(); ctx.stroke();
         ctx.fillStyle = rect.color; ctx.beginPath(); ctx.arc(rect.x + 13, rect.y + 16, 4, 0, Math.PI * 2); ctx.fill();
         const nameRoom = rect.contextPercent !== undefined ? rect.width - 52 : rect.width - 28;
-        ctx.fillStyle = "#e6f1f2"; ctx.font = `${rect.entity.type === "instance" ? "600 13px" : "500 11px"} ui-monospace, monospace`;
+        ctx.fillStyle = "#e6f1f2"; ctx.font = `${rect.entity.type === "instance" ? "600 13px" : "500 11px"} ${CANVAS_MONO_FONT}`;
         ctx.fillText(short(rect.label, Math.max(10, Math.floor(nameRoom / (rect.entity.type === "instance" ? 7.2 : 6.4)))), rect.x + 24, rect.y + 20);
-        ctx.font = "10px ui-monospace, monospace";
+        ctx.font = `10px ${CANVAS_MONO_FONT}`;
         ctx.fillStyle = rect.color; ctx.fillText(rect.status.toUpperCase(), rect.x + 24, rect.y + 37);
         if (rect.span && rect.entity.type !== "peer") {
           const statusW = ctx.measureText(rect.status.toUpperCase()).width;
           ctx.fillStyle = "#77939a"; ctx.fillText(` · ${rect.span}`, rect.x + 24 + statusW, rect.y + 37);
         }
         if (rect.detail && rect.entity.type !== "peer") {
-          ctx.fillStyle = "#8aa4aa"; ctx.font = "9px ui-monospace, monospace";
+          ctx.fillStyle = "#8aa4aa"; ctx.font = `9px ${CANVAS_MONO_FONT}`;
           ctx.fillText(short(rect.detail, Math.max(12, Math.floor((rect.width - 20) / 5.4))), rect.x + 24, rect.y + 52);
         }
         if (rect.contextPercent !== undefined) {
           const ringX = rect.x + rect.width - 24; const ringY = rect.y + 29;
           ctx.strokeStyle = "#193b44"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(ringX, ringY, 10, 0, Math.PI * 2); ctx.stroke();
           ctx.strokeStyle = rect.color; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(ringX, ringY, 10, -Math.PI / 2, -Math.PI / 2 + (Math.min(100, rect.contextPercent) / 100) * Math.PI * 2); ctx.stroke();
-          ctx.fillStyle = "#d5ecec"; ctx.font = "7px ui-monospace, monospace"; ctx.textAlign = "center";
+          ctx.fillStyle = "#d5ecec"; ctx.font = `7px ${CANVAS_MONO_FONT}`; ctx.textAlign = "center";
           ctx.fillText(`${Math.round(rect.contextPercent)}%`, ringX, ringY + 3); ctx.textAlign = "start";
         }
         if (rect.meta) {
-          ctx.fillStyle = "#7f9ea4"; ctx.font = "8px ui-monospace, monospace"; ctx.textAlign = "right";
+          ctx.fillStyle = "#7f9ea4"; ctx.font = `8px ${CANVAS_MONO_FONT}`; ctx.textAlign = "right";
           ctx.fillText(rect.meta, rect.x + rect.width - 8, rect.y + 52); ctx.textAlign = "start";
         }
       });
-      instances.forEach((root) => { ctx.fillStyle = "#6c8b92"; ctx.font = "10px ui-monospace, monospace"; ctx.fillText("PI INSTANCE  /  EXOCOM", root.x - 2, root.y - 27); });
+      instances.forEach((root) => { ctx.fillStyle = "#6c8b92"; ctx.font = `10px ${CANVAS_MONO_FONT}`; ctx.fillText(instanceCanvasCaption(graph.instances[root.entity.key]), root.x - 2, root.y - 27); });
       ctx.restore(); if (animatedTraffic) raf = requestAnimationFrame(draw);
     }; raf = requestAnimationFrame(draw); return () => cancelAnimationFrame(raf);
-  }, [layout, reducedMotion, selected, size]);
+  }, [layout, reducedMotion, selected, size, surface.scale]);
 
-  return <div className="graph-canvas-shell">
-    <canvas ref={canvasRef} width={size.width} height={size.height} aria-hidden="true" />
-    <div className="graph-node-targets" role="group" aria-label="Live Pi instance and agent topology">
-      {layout.rects.map((rect) => <button
-        type="button"
-        className="graph-node-target"
-        key={`${rect.entity.type}:${rect.entity.key}`}
-        style={{ left: `${rect.x / layout.width * 100}%`, top: `${rect.y / layout.height * 100}%`, width: `${rect.width / layout.width * 100}%`, height: `${rect.height / layout.height * 100}%` }}
-        aria-label={`${rect.entity.type} ${rect.label}, ${rect.status}${rect.detail ? `, ${rect.detail}` : ""}`}
-        aria-pressed={selected?.type === rect.entity.type && selected.key === rect.entity.key}
-        onClick={() => onSelect(rect.entity)}
-      />)}
+  return <div className="graph-viewport" ref={viewportRef}>
+    <div className="graph-canvas-shell" style={{ width: `${surface.cssWidth}px`, height: `${surface.cssHeight}px` }}>
+      <canvas ref={canvasRef} width={surface.pixelWidth} height={surface.pixelHeight} style={{ width: `${surface.cssWidth}px`, height: `${surface.cssHeight}px` }} aria-hidden="true" />
+      <div className="graph-node-targets" role="group" aria-label="Live Pi instance and agent topology">
+        {layout.rects.map((rect) => <button
+          type="button"
+          className="graph-node-target"
+          key={`${rect.entity.type}:${rect.entity.key}`}
+          style={{ left: `${rect.x / layout.width * 100}%`, top: `${rect.y / layout.height * 100}%`, width: `${rect.width / layout.width * 100}%`, height: `${rect.height / layout.height * 100}%` }}
+          aria-label={`${rect.entity.type} ${rect.label}, ${rect.status}${rect.detail ? `, ${rect.detail}` : ""}`}
+          aria-pressed={selected?.type === rect.entity.type && selected.key === rect.entity.key}
+          onClick={() => onSelect(rect.entity)}
+        />)}
+      </div>
     </div>
   </div>;
 }
 
 function StatusDot({ status }: { status: string }): ReactElement { return <span className={`status-dot status-${status}`} aria-label={status} />; }
 
-function ToolCalls({ tools, selected, onSelect }: { tools: ToolView[]; selected?: EntityId; onSelect: (entity: EntityId) => void }): ReactElement {
-  return <div className="inspector-section"><span className="eyebrow">TOOL CALLS · {tools.length}</span>{tools.length === 0 ? <div className="empty-small">No tool calls for this node.</div> : tools.slice(0, 12).map((tool) => <button type="button" key={tool.key} className={`tool-row${selected?.type === "tool" && selected.key === tool.key ? " active" : ""}`} onClick={() => onSelect({ type: "tool", key: tool.key })}><StatusDot status={tool.status} /><span>{tool.name}</span><b>{tool.status}</b><em>{tool.durationMs !== undefined ? formatDuration(tool.durationMs) : relative(tool.startedAt)}</em></button>)}</div>;
+export function ToolCalls({ tools, selected, onSelect }: { tools: ToolView[]; selected?: EntityId; onSelect: (entity: EntityId) => void }): ReactElement {
+  const [visibleCount, setVisibleCount] = useState(12);
+  const shown = tools.slice(0, visibleCount);
+  const count = shown.length < tools.length ? `${shown.length} of ${tools.length}` : String(tools.length);
+  return <div className="inspector-section"><span className="eyebrow">TOOL CALLS · {count}</span>{tools.length === 0 ? <div className="empty-small">No tool calls for this node.</div> : <>{shown.map((tool) => <button type="button" key={tool.key} className={`tool-row${selected?.type === "tool" && selected.key === tool.key ? " active" : ""}`} onClick={() => onSelect({ type: "tool", key: tool.key })}><StatusDot status={tool.status} /><span>{tool.name}</span><b>{tool.status}</b><em>{tool.durationMs !== undefined ? formatDuration(tool.durationMs) : relative(tool.startedAt)}</em></button>)}{shown.length < tools.length && <button type="button" className="history-more" onClick={() => setVisibleCount((current) => Math.min(tools.length, current + 12))}>Show {Math.min(12, tools.length - shown.length)} more tools</button>}</>}</div>;
 }
 
-function Inspector({ graph, selected, onClose, onSelect }: { graph: GraphState; selected?: EntityId; onClose: () => void; onSelect: (entity: EntityId) => void }): ReactElement {
+export function Inspector({ graph, selected, onClose, onSelect }: { graph: GraphState; selected?: EntityId; onClose: () => void; onSelect: (entity: EntityId) => void }): ReactElement {
+  const [visibleTrafficCount, setVisibleTrafficCount] = useState(5);
   const instance = selected?.type === "instance" ? graph.instances[selected.key] : undefined;
   const agent = selected?.type === "agent" ? graph.agents[selected.key] : undefined;
   const tool = selected?.type === "tool" ? graph.tools[selected.key] : undefined;
   const peer = selected?.type === "peer" ? graph.peers[selected.key] : undefined;
-  const title = instance?.displayName ?? agent?.label ?? tool?.name ?? peer?.displayName ?? "Nothing selected";
+  const entityPresent = instance !== undefined || agent !== undefined || tool !== undefined || peer !== undefined;
+  const title = instance?.displayName ?? agent?.label ?? tool?.name ?? peer?.displayName ?? (selected ? "Not present at this replay position" : "Nothing selected");
   const relatedMessages = selected ? messagesForSelection(graph.messages, selected) : [];
+  const relatedMessageCount = selected ? messageCountForSelection(graph.messages, selected) : 0;
+  const visibleMessages = relatedMessages.slice(0, visibleTrafficCount);
   const relatedTools = selected && selected.type !== "peer" ? toolsForSelection(graph, selected) : [];
   const status = instance?.status ?? (agent ? displayAgentStatus(agent.status, toolStats(relatedTools)) : undefined) ?? tool?.status ?? peer?.status;
   const toolAgent = tool ? graph.agents[tool.agentKey] : undefined;
@@ -532,11 +627,11 @@ function Inspector({ graph, selected, onClose, onSelect }: { graph: GraphState; 
   const last = instance ? relative(instance.updatedAt) : agent ? relative(agent.updatedAt) : tool ? relative(tool.endedAt ?? tool.startedAt) : "—";
   return <aside className="inspector" aria-label="Selected node inspector">
     <div className="inspector-head"><div><span className="eyebrow">NODE INSPECTOR</span><h2>{title}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close inspector"><X size={16} /></button></div>
-    {selected ? <>
+    {selected && !entityPresent ? <div className="empty-inspector replay-absent"><CircleDot size={28} /><p>This {selected.type} is not present at this replay position.</p><span className="mono">{short(selected.key, 30)}</span></div> : selected ? <>
       <div className="inspector-status"><StatusDot status={status ?? "idle"} /><b>{status}</b><span className="mono">{selected.type}</span></div>
       <div className="metric-grid"><div><span>IDENTIFIER</span><b>{short(selected.key, 30)}</b></div><div><span>LAST SIGNAL</span><b>{last}</b></div></div>
       {instance && <><div className="context-meter"><div><span>CONTEXT WINDOW</span><b>{instance.contextPercent}%</b></div><div className="meter"><i style={{ width: `${Math.min(100, instance.contextPercent)}%` }} /></div></div><dl className="detail-list"><div><dt>PRODUCER</dt><dd>{instance.producerId}</dd></div><div><dt>SESSION</dt><dd title={instance.sessionId}>{short(instance.sessionId)}</dd></div><div><dt>PERSONA</dt><dd>{instance.persona || "unassigned"}</dd></div><div><dt>MODEL</dt><dd>{instance.model || "auto"}</dd></div><div><dt>DURATION</dt><dd>{formatElapsed(instance.updatedAt - instance.startedAt)}</dd></div><div><dt>PID</dt><dd>{instance.pid || "—"}</dd></div></dl></>}
-      {agent && <dl className="detail-list"><div><dt>PRODUCER</dt><dd>{agent.producerId}</dd></div><div><dt>SESSION</dt><dd title={agent.sessionId}>{short(agent.sessionId)}</dd></div><div><dt>KIND</dt><dd>{agent.kind}</dd></div><div><dt>AGENT</dt><dd>{agent.agent ?? "—"}</dd></div><div><dt>PERSONA</dt><dd>{agent.persona ?? "—"}</dd></div><div><dt>MODEL</dt><dd>{modelLabel(agent.model) || "—"}</dd></div><div><dt>DURATION</dt><dd>{formatElapsed((agent.endedAt ?? agent.updatedAt) - agent.startedAt)}</dd></div><div><dt>TOOLS</dt><dd>{(() => { const stats = toolStats(relatedTools); return `${stats.total}${stats.failed ? ` · ${stats.failed} failed` : ""}${stats.running ? ` · ${stats.running} live` : ""}`; })()}</dd></div></dl>}
+      {agent && <dl className="detail-list"><div><dt>PRODUCER</dt><dd>{agent.producerId}</dd></div><div><dt>SESSION</dt><dd title={agent.sessionId}>{short(agent.sessionId)}</dd></div><div><dt>KIND</dt><dd>{agent.kind}</dd></div><div><dt>AGENT</dt><dd>{agent.agent ?? "—"}</dd></div><div><dt>PERSONA</dt><dd>{agent.persona ?? "—"}</dd></div><div><dt>MODEL</dt><dd>{modelLabel(agent.model) || "—"}</dd></div><div><dt>DURATION</dt><dd>{formatElapsed(agentElapsed(graph, agent))}</dd></div><div><dt>TOOLS</dt><dd>{(() => { const stats = toolStats(relatedTools); return `${stats.total}${stats.failed ? ` · ${stats.failed} failed` : ""}${stats.running ? ` · ${stats.running} live` : ""}`; })()}</dd></div></dl>}
       {peer && <><div className="context-meter"><div><span>CONTEXT WINDOW</span><b>{peer.contextPercent}%</b></div><div className="meter"><i style={{ width: `${Math.min(100, peer.contextPercent)}%` }} /></div></div><dl className="detail-list"><div><dt>PERSONA</dt><dd>{peer.persona || "unassigned"}</dd></div><div><dt>MODEL</dt><dd>{peer.model || "auto"}</dd></div><div><dt>SENT / RX</dt><dd>{peer.sent} / {peer.received}</dd></div></dl></>}
       {tool && <dl className="detail-list">
         <div><dt>PRODUCER</dt><dd>{tool.producerId}</dd></div>
@@ -545,8 +640,8 @@ function Inspector({ graph, selected, onClose, onSelect }: { graph: GraphState; 
         <div><dt>DURATION</dt><dd>{tool.durationMs !== undefined ? formatDuration(tool.durationMs) : tool.status === "running" ? "running" : "—"}</dd></div>
         <div><dt>AGENT</dt><dd><button type="button" className="linkish" onClick={() => onSelect(toolAgent ? { type: "agent", key: tool.agentKey } : { type: "instance", key: toolInstanceKey })}>{toolAgent?.label ?? graph.instances[toolInstanceKey]?.displayName ?? tool.agentId}</button></dd></div>
       </dl>}
-      {(instance || agent || tool) && <ToolCalls tools={relatedTools} selected={selected} onSelect={onSelect} />}
-      <div className="inspector-section"><span className="eyebrow">RECENT TRAFFIC</span>{relatedMessages.length ? relatedMessages.map((message) => <div className="traffic-row" key={message.key}><span className={`channel-mark ${message.channel}`} /><span className="traffic-copy"><strong>{message.channel.toUpperCase()} · {message.kind}</strong><span title={messageRouteIds(message)}>{messageRoute(message, selected, graph)}</span><em>{message.size} B · {message.replyTo ? `reply to ${short(message.replyTo, 12)}` : message.expectsReply ? "reply expected" : "one-way"}</em></span><span className="traffic-state"><b>{message.status}</b><time title={new Date(message.ts).toISOString()}>{relative(message.ts)}</time></span></div>) : <div className="empty-small">No message frames for this node.</div>}</div>
+      {(instance || agent || tool) && <ToolCalls key={`${selected?.type ?? "none"}:${selected?.key ?? ""}`} tools={relatedTools} selected={selected} onSelect={onSelect} />}
+      <div className="inspector-section"><span className="eyebrow">RECENT TRAFFIC · {visibleMessages.length < relatedMessageCount ? `${visibleMessages.length} of ${relatedMessageCount}` : relatedMessageCount}</span>{relatedMessages.length ? <>{visibleMessages.map((message) => <div className="traffic-row" key={message.key}><span className={`channel-mark ${message.channel}`} /><span className="traffic-copy"><strong>{message.channel.toUpperCase()} · {message.kind}</strong><span title={messageRouteIds(message)}>{messageRoute(message, selected, graph)}</span><em title={messageTraceMetadata(message)}>{message.size} B · {message.wireId ? `wire ${short(message.wireId, 12)} · ` : ""}{message.replyTo ? `reply to ${short(message.replyTo, 12)}` : message.expectsReply ? "reply expected" : "one-way"}</em></span><span className="traffic-state"><b>{message.status}</b><time title={new Date(message.ts).toISOString()}>{relative(message.ts)}</time></span></div>)}{visibleMessages.length < relatedMessageCount && <button type="button" className="history-more" onClick={() => setVisibleTrafficCount((current) => Math.min(relatedMessageCount, current + 5))}>Show {Math.min(5, relatedMessageCount - visibleMessages.length)} more traffic</button>}</> : <div className="empty-small">No message frames for this node.</div>}</div>
     </> : <div className="empty-inspector"><CircleDot size={28} /><p>Select an instance, agent, or tool call to inspect live telemetry.</p></div>}
   </aside>;
 }
@@ -571,13 +666,13 @@ export function Timeline({ events, playing, cursor, onPlay, onCursor }: { events
     }, 900);
     return () => window.clearInterval(timer);
   }, [playing, cursor, max, empty, onCursor, onPlay]);
-  return <section className="timeline" aria-label="Telemetry timeline"><div className="timeline-head"><div className="timeline-title"><Clock3 size={15} /><span>EVENT STREAM</span><b>{events.length}</b></div><div className="timeline-mode"><button className={live ? "active" : ""} onClick={() => onCursor(undefined)}><Radio size={13} />LIVE</button><button className={!live ? "active" : ""} disabled={empty} onClick={() => onCursor(cursor ?? max)}><Search size={13} />REVIEW</button></div></div><div className="timeline-track"><div className="timeline-progress" style={{ width: `${(selectedCursor / span) * 100}%` }} /><input aria-label="Replay event position" type="range" min="0" max={max} value={selectedCursor} onChange={(event) => onCursor(Number(event.target.value))} />{events.filter((_, index) => index % Math.max(1, Math.floor(events.length / 12)) === 0).map((event, index) => <span key={`${event.id}-${index}`} style={{ left: `${(events.indexOf(event) / span) * 100}%` }} className={`tick tick-${event.type.split(".")[0]}`} />)}</div><div className="timeline-foot"><button className="play-button" disabled={empty} onClick={onPlay} aria-label={playing ? "Pause replay" : "Play replay"}>{playing ? <Pause size={14} /> : <Play size={14} />}</button><span className="mono">{live ? "NOW / FOLLOWING" : `${events[cursor ?? 0] ? formatTime(events[cursor ?? 0].ts) : "—"} / REPLAY`}</span><div className="event-pills">{events.slice(-3).reverse().map((event) => <span key={event.id}><StatusDot status="running" />{eventLabel(event.type)}</span>)}</div><button className="icon-button" onClick={() => onCursor(undefined)} aria-label="Return to live"><RotateCcw size={14} /></button></div></section>;
+  return <section className="timeline" aria-label="Telemetry timeline in recorded event order"><div className="timeline-head"><div className="timeline-title"><Clock3 size={15} /><span>RECORDED EVENT ORDER</span><b>{events.length} in window</b></div><div className="timeline-mode"><button className={live ? "active" : ""} onClick={() => onCursor(undefined)}><Radio size={13} />LIVE</button><button className={!live ? "active" : ""} disabled={empty} onClick={() => onCursor(cursor ?? max)}><Search size={13} />REVIEW</button></div></div><div className="timeline-track"><div className="timeline-progress" style={{ width: `${(selectedCursor / span) * 100}%` }} /><input aria-label="Replay event position in recorded order" type="range" min="0" max={max} value={selectedCursor} onChange={(event) => onCursor(Number(event.target.value))} />{events.filter((_, index) => index % Math.max(1, Math.floor(events.length / 12)) === 0).map((event, index) => <span key={`${event.id}-${index}`} style={{ left: `${(events.indexOf(event) / span) * 100}%` }} className={`tick tick-${event.type.split(".")[0]}`} />)}</div><div className="timeline-foot"><button className="play-button" disabled={empty} onClick={onPlay} aria-label={playing ? "Pause replay" : "Play replay"}>{playing ? <Pause size={14} /> : <Play size={14} />}</button><span className="mono">{live ? "NOW / FOLLOWING RECORDED ORDER" : `${events[cursor ?? 0] ? formatTime(events[cursor ?? 0].ts) : "—"} / RECORDED ORDER`}</span><div className="event-pills">{events.slice(-3).reverse().map((event) => <span key={event.id}><StatusDot status="running" />{eventLabel(event.type)}</span>)}</div><button className="icon-button" onClick={() => onCursor(undefined)} aria-label="Return to live"><RotateCcw size={14} /></button></div></section>;
 }
 
 function App(): ReactElement {
-  const { graph, connection, error } = useDashboard();
-  const [filters, setFilters] = useState<Filters>({ instance: "", persona: "", channel: "all", attention: "all" });
-  const [selected, setSelected] = useState<EntityId>(); const [inspectorOpen, setInspectorOpen] = useState(() => typeof window !== "undefined" && window.matchMedia("(min-width: 761px)").matches); const [playing, setPlaying] = useState(false); const [cursor, setCursor] = useState<number>();
+  const { graph, connection, error, workspaces, selectedWorkspaceId, selectWorkspace } = useDashboard();
+  const { filters, setFilters, selected, setSelected, playing, setPlaying, cursor, setCursor } = useWorkspaceViewState(selectedWorkspaceId);
+  const [inspectorOpen, setInspectorOpen] = useState(() => typeof window !== "undefined" && window.matchMedia("(min-width: 761px)").matches);
   // Stable, so the replay interval is not torn down and rebuilt on every render that passes it down.
   const togglePlay = useCallback(() => setPlaying((value) => !value), []);
   useEffect(() => {
@@ -592,7 +687,9 @@ function App(): ReactElement {
   const displayedGraph = timeline.graph;
   const presenceGraph = cursor === undefined ? livePresence(displayedGraph) : displayedGraph;
   const filteredGraph = useFilteredGraph(presenceGraph, filters);
-  const instances = Object.entries(presenceGraph.instances); const personas = [...new Set(instances.map(([, instance]) => instance.persona).filter(Boolean))];
+  const instances = Object.entries(presenceGraph.instances); const instanceViews = instances.map(([, instance]) => instance); const personas = [...new Set(instances.map(([, instance]) => instance.persona).filter(Boolean))];
+  const selectedWorkspace = workspaces.find((workspace) => workspace.id === selectedWorkspaceId);
+  const workspaceHeading = selectedWorkspace?.label ?? (selectedWorkspaceId ? `Workspace unavailable · ${selectedWorkspaceId}` : "No workspace available");
   const instanceIds = instances.map(([id]) => id).join(","); const personaIds = personas.join(",");
   // A scope filter must not outlive the option that set it. When the chosen instance stops, LIVE drops
   // it, its <option> disappears, and a controlled <select> with no matching option displays row 0 —
@@ -607,7 +704,8 @@ function App(): ReactElement {
   const updateFilter = <K extends keyof Filters>(key: K, value: Filters[K]): void => setFilters((current) => ({ ...current, [key]: value }));
   const graphToShow = filters.attention === "attention" ? attentionGraph(filteredGraph) : filteredGraph;
   const runningTools = Object.values(presenceGraph.tools).filter((tool) => tool.status === "running" && liveStream(presenceGraph.instances[entityKey(tool.producerId, tool.sessionId)]?.status ?? "stale")).length;
-  return <div className="app-shell"><header className="topbar"><div className="brand"><div className="brand-mark"><Command size={17} /></div><div><b>PI PERSONA FLOW</b><span>CONTROL ROOM <i>·</i> LOCAL TELEMETRY</span></div></div><div className="topbar-center"><span className="live-indicator"><i />{connection === "live" ? "LIVE" : connection.toUpperCase()}</span><span className="workspace-path"><Server size={13} />{instances.length > 0 ? "local workspace" : "waiting for workspace"}</span></div></header><main className="control-room"><aside className="rail"><div className="rail-section"><span className="eyebrow">SCOPE</span><label className="select-wrap"><Layers3 size={14} /><select value={filters.instance} onChange={(event) => updateFilter("instance", event.target.value)}><option value="">All instances · {instances.length}</option>{instances.map(([id, instance]) => <option key={id} value={id}>{instance.displayName}</option>)}</select></label><label className="select-wrap"><Sparkles size={14} /><select value={filters.persona} onChange={(event) => updateFilter("persona", event.target.value)}><option value="">All personas</option>{personas.map((persona) => <option key={persona} value={persona}>{persona}</option>)}</select></label></div><div className="rail-section"><span className="eyebrow">CHANNEL</span><div className="segmented" role="group" aria-label="Message channel filter">{(["all", "intercom", "exocom"] as const).map((channel) => <button key={channel} className={filters.channel === channel ? "active" : ""} onClick={() => updateFilter("channel", channel)}>{channel === "all" ? "ALL" : channel.toUpperCase()}</button>)}</div></div><div className="rail-section"><span className="eyebrow">ATTENTION</span><button className={`attention-toggle ${filters.attention === "attention" ? "active" : ""}`} onClick={() => updateFilter("attention", filters.attention === "all" ? "attention" : "all")}><AlertTriangle size={14} />Needs attention <b>{attentionCount}</b></button></div><div className="rail-section rail-stats"><span className="eyebrow">SYSTEM PULSE</span><div className="rail-stat"><Activity size={15} /><span>AGENTS</span><b>{Object.keys(graphToShow.agents).length}</b></div><div className="rail-stat"><Wifi size={15} /><span>EXOCOM PEERS</span><b>{distinctPeers(graphToShow)}</b></div><div className="rail-stat"><Terminal size={15} /><span>TOOLS ACTIVE</span><b>{runningTools}</b></div></div><div className="rail-legend"><span><i className="legend-dot cyan" />INTERCOM</span><span><i className="legend-dot magenta" />EXOCOM</span><span><i className="legend-line" />HIERARCHY</span></div></aside><section className="workspace"><div className="workspace-head"><div><span className="eyebrow">TOPOLOGY / {filters.attention === "attention" ? "ATTENTION VIEW" : "ALL SIGNALS"}</span><h1>Lifecycle topology</h1><p>Instances contain lifecycle graphs; semantic channels overlay directional traffic.</p></div><div className="workspace-summary"><div><span>INSTANCES</span><b>{Object.keys(graphToShow.instances).length}</b></div><div><span>EVENTS</span><b>{graph.events.length.toLocaleString()}</b></div><div className="signal-summary"><StatusDot status="running" /><span>STREAM HEALTH</span></div></div></div>{error && <div className="notice"><AlertTriangle size={14} />{error}</div>}<div className="graph-frame"><GraphCanvas graph={graphToShow} selected={selected} onSelect={(entity) => { setSelected(entity); setInspectorOpen(true); }} /><div className="graph-hint"><span><span className="keycap">CLICK</span> inspect node</span><span><span className="keycap">LIVE</span> canvas follows stream</span></div>{Object.keys(graphToShow.instances).length === 0 && Object.keys(graphToShow.peers).length === 0 && <div className="empty-graph"><Bot size={32} /><b>Awaiting Pi telemetry</b><span>Start a session to populate the control room.</span></div>}</div><Timeline events={timeline.events} playing={playing} cursor={cursor} onPlay={togglePlay} onCursor={setCursor} /></section>{inspectorOpen && <Inspector graph={displayedGraph} selected={selected} onClose={() => setInspectorOpen(false)} onSelect={setSelected} />} {!inspectorOpen && <button className="reopen-inspector" onClick={() => setInspectorOpen(true)}><ChevronRight size={16} />INSPECTOR</button>}</main></div>;
+  const connectionView = connectionPresentation(connection);
+  return <div className="app-shell"><header className="topbar"><div className="brand"><div className="brand-mark"><Command size={17} /></div><div><b>PI PERSONA FLOW</b><span>CONTROL ROOM <i>·</i> SHARED TELEMETRY</span></div></div><div className="topbar-center"><span className={`live-indicator ${connectionView.className}`}><i className={`status-dot ${connectionView.dotClassName}`} />{connectionView.label}</span><span className="workspace-path" title={selectedWorkspace?.id}><Server size={13} />{workspaceHeading}</span></div></header><main className={`control-room${inspectorOpen ? "" : " inspector-closed"}`}><aside className="rail"><div className="rail-section"><span className="eyebrow">WORKSPACE</span><label className="select-wrap"><Server size={14} /><select aria-label="Workspace" value={selectedWorkspaceId} disabled={workspaces.length === 0} onChange={(event) => selectWorkspace(event.target.value)}>{selectedWorkspaceId && !selectedWorkspace ? <option value={selectedWorkspaceId}>Unavailable · {selectedWorkspaceId}</option> : null}{workspaces.length === 0 ? <option value={selectedWorkspaceId}>{selectedWorkspaceId ? `Unavailable · ${selectedWorkspaceId}` : "No workspaces available"}</option> : workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspaceOptionLabel(workspace, workspaces)}</option>)}</select></label></div><div className="rail-section"><span className="eyebrow">SCOPE</span><label className="select-wrap"><Layers3 size={14} /><select aria-label="Instance" value={filters.instance} onChange={(event) => updateFilter("instance", event.target.value)}><option value="">All instances · {instances.length}</option>{instances.map(([id, instance]) => <option key={id} value={id}>{instanceOptionLabel(instance, instanceViews)}</option>)}</select></label><label className="select-wrap"><Sparkles size={14} /><select aria-label="Persona" value={filters.persona} onChange={(event) => updateFilter("persona", event.target.value)}><option value="">All personas</option>{personas.map((persona) => <option key={persona} value={persona}>{persona}</option>)}</select></label></div><div className="rail-section"><span className="eyebrow">CHANNEL</span><div className="segmented" role="group" aria-label="Message channel filter">{(["all", "intercom", "exocom"] as const).map((channel) => <button key={channel} className={filters.channel === channel ? "active" : ""} onClick={() => updateFilter("channel", channel)}>{channel === "all" ? "ALL" : channel.toUpperCase()}</button>)}</div></div><div className="rail-section"><span className="eyebrow">ATTENTION</span><button className={`attention-toggle ${filters.attention === "attention" ? "active" : ""}`} onClick={() => updateFilter("attention", filters.attention === "all" ? "attention" : "all")}><AlertTriangle size={14} />Needs attention <b>{attentionCount}</b></button></div><div className="rail-section rail-stats"><span className="eyebrow">SYSTEM PULSE</span><div className="rail-stat"><Activity size={15} /><span>AGENTS</span><b>{Object.keys(graphToShow.agents).length}</b></div><div className="rail-stat"><Wifi size={15} /><span>EXOCOM PEERS</span><b>{distinctPeers(graphToShow)}</b></div><div className="rail-stat"><Terminal size={15} /><span>TOOLS ACTIVE</span><b>{runningTools}</b></div></div><div className="rail-legend"><span><i className="legend-dot cyan" />INTERCOM</span><span><i className="legend-dot magenta" />EXOCOM</span><span><i className="legend-line" />HIERARCHY</span></div></aside><section className="workspace"><div className="workspace-head"><div><span className="eyebrow">TOPOLOGY / {filters.attention === "attention" ? "ATTENTION VIEW" : "ALL SIGNALS"}</span><h1>Lifecycle topology</h1><p>Instances contain lifecycle graphs; semantic channels overlay directional traffic.</p></div><div className="workspace-summary"><div><span>INSTANCES</span><b>{Object.keys(graphToShow.instances).length}</b></div><div><span>RETAINED EVENTS</span><b>{graph.events.length.toLocaleString()}</b></div><div className={`signal-summary ${connectionView.className}`}><StatusDot status={connection} /><span>DASHBOARD LINK</span></div></div></div>{error && <div className="notice"><AlertTriangle size={14} />{error}</div>}<div className="graph-frame"><GraphCanvas graph={graphToShow} selected={selected} onSelect={(entity) => { setSelected(entity); setInspectorOpen(true); }} /><div className="graph-hint"><span><span className="keycap">CLICK</span> inspect node</span><span><span className="keycap">LIVE</span> canvas follows stream</span></div>{Object.keys(graphToShow.instances).length === 0 && Object.keys(graphToShow.peers).length === 0 && <div className="empty-graph"><Bot size={32} /><b>Awaiting Pi telemetry</b><span>Start a session to populate the control room.</span></div>}</div><Timeline events={timeline.events} playing={playing} cursor={cursor} onPlay={togglePlay} onCursor={setCursor} /></section>{inspectorOpen && <Inspector key={`${selected?.type ?? "none"}:${selected?.key ?? ""}:${cursor === undefined ? "live" : cursor}`} graph={displayedGraph} selected={selected} onClose={() => setInspectorOpen(false)} onSelect={setSelected} />} {!inspectorOpen && <button className="reopen-inspector" onClick={() => setInspectorOpen(true)}><ChevronRight size={16} />INSPECTOR</button>}</main></div>;
 }
 
 export default App;

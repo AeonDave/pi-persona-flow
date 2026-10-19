@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { isConsumerNotice, type TelemetryDelta, type EventStore, type TelemetrySnapshot } from "./event-store.ts";
+import { CONTROL_TOKEN_HEADER, SHARED_SERVICE_PROTOCOL, type WorkspaceCatalog } from "../shared/workspaces.ts";
+import type { WorkspaceSource } from "./service/registry.ts";
 
 export const DASHBOARD_TOKEN_LENGTH = 4;
 export const DASHBOARD_TOKEN_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -31,7 +33,13 @@ export function createDashboardToken(): string {
 
 export interface FlowServerOptions {
   port: number;
-  store: EventStore;
+  /** A legacy single-workspace source. New shared services should provide workspaceSource. */
+  store?: EventStore;
+  workspaceSource?: WorkspaceSource;
+  /** Private local control plane; never reused as the browser/dashboard token. */
+  controlPlane?: FlowControlPlane;
+  controlToken?: string;
+  serviceId?: string;
   staticDir?: string;
   token?: string;
   /** Override the keep-alive interval for deterministic tests; defaults to 15s. */
@@ -42,6 +50,13 @@ export interface FlowServerOptions {
   maxStreamBufferBytes?: number;
   /** Override the concurrent /api/stream ceiling; defaults to 32. */
   maxStreamClients?: number;
+}
+
+export interface FlowControlPlane {
+  register(value: unknown): { workspaceId: string };
+  heartbeat(clientId: string): boolean;
+  unregister(clientId: string): boolean;
+  ingest(clientId: string, events: readonly unknown[]): { accepted: number; rejected: number };
 }
 
 export interface FlowServer {
@@ -84,7 +99,12 @@ export function startServer(
   const options: FlowServerOptions = typeof optionsOrPort === "number"
     ? { port: optionsOrPort, store: legacySource as EventStore }
     : optionsOrPort;
-  const source = (legacySource ?? options.store) as unknown as SnapshotSource;
+  const baseSource = (legacySource ?? options.store) as unknown as SnapshotSource | undefined;
+  if (!legacySource && !options.workspaceSource && !options.store) throw new TypeError("store or workspaceSource is required");
+  const workspaceSource: WorkspaceSource = options.workspaceSource ?? singleWorkspaceSource(baseSource!);
+  if (Boolean(options.controlPlane) !== Boolean(options.controlToken) || Boolean(options.controlPlane) !== Boolean(options.serviceId)) {
+    throw new TypeError("controlPlane, controlToken, and serviceId must be provided together");
+  }
   const staticDir = options.staticDir ?? DEFAULT_STATIC_DIRS.find((dir) => fs.existsSync(dir)) ?? DEFAULT_STATIC_DIRS[0]!;
   const token = options.token ?? createDashboardToken();
   const heartbeatMs = options.heartbeatMs ?? 15_000;
@@ -122,14 +142,24 @@ export function startServer(
     if (pathname.startsWith("/api/")) {
       if (req.method !== "GET") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
       if (!authorized(req, requestUrl, token, cookieName)) return unauthorized(res);
+      if (pathname === "/api/workspaces") {
+        return sendJson(res, workspaceSource.catalog());
+      }
       if (pathname === "/api/snapshot") {
-        return sendJson(res, source.snapshot());
+        const source = resolveWorkspace(requestUrl, workspaceSource);
+        return source ? sendJson(res, source.snapshot()) : send(res, 404, "Unknown Workspace", "text/plain; charset=utf-8");
       }
       if (pathname === "/api/stream") {
+        const source = resolveWorkspace(requestUrl, workspaceSource);
+        if (!source) return send(res, 404, "Unknown Workspace", "text/plain; charset=utf-8");
         if (clients.size >= maxStreamClients) return send(res, 503, "Too Many Streams", "text/plain; charset=utf-8");
         return openStream(req, res, source, clients, requestUrl, heartbeatMs, maxStreamBufferBytes);
       }
       return send(res, 404, "Not Found", "text/plain; charset=utf-8");
+    }
+
+    if (pathname.startsWith("/internal/")) {
+      return void handleControlRequest(req, res, pathname, options);
     }
 
     if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
@@ -150,7 +180,7 @@ export function startServer(
       // Ageing a stream out is a wall-clock event with no producer to trigger it, so the dashboard
       // has to drive it on its own tick or a crashed producer never leaves a connected client's
       // screen. Unref'd so the host process can still exit while a session is idle.
-      const sweep = setInterval(() => { if (!closed) source.sweepStale(); }, staleSweepMs);
+      const sweep = setInterval(() => { if (!closed) workspaceSource.sweepStale(); }, staleSweepMs);
       sweep.unref?.();
       const flow: FlowServer = {
         port,
@@ -182,6 +212,123 @@ export function startServer(
       };
       resolve(flow);
     });
+  });
+}
+
+function singleWorkspaceSource(source: SnapshotSource): WorkspaceSource {
+  return {
+    catalog: (): WorkspaceCatalog => ({
+      // This adapter has no attachment lifecycle, so zero honestly means "no last-seen sample".
+      // Stamping catalog polls with Date.now() would fabricate activity for an idle legacy store.
+      workspaces: [{ id: "local", label: "local", activeSessions: 0, lastSeenAt: 0 }],
+      defaultWorkspaceId: "local",
+    }),
+    resolve: (workspaceId) => workspaceId === undefined || workspaceId === "local" ? source as EventStore : undefined,
+    sweepStale: () => source.sweepStale(),
+  };
+}
+
+function resolveWorkspace(url: URL, source: WorkspaceSource): SnapshotSource | undefined {
+  const workspaceId = url.searchParams.has("workspace") ? url.searchParams.get("workspace") ?? "" : undefined;
+  return source.resolve(workspaceId) as SnapshotSource | undefined;
+}
+
+async function handleControlRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  pathname: string,
+  options: FlowServerOptions,
+): Promise<unknown> {
+  const plane = options.controlPlane;
+  const token = options.controlToken;
+  const serviceId = options.serviceId;
+  if (!plane || !token || !serviceId) return send(res, 404, "Not Found", "text/plain; charset=utf-8");
+  if (req.headers.origin !== undefined) return send(res, 403, "Forbidden", "text/plain; charset=utf-8");
+  if (!matchesToken(req.headers[CONTROL_TOKEN_HEADER], token)) return unauthorized(res);
+
+  if (pathname === "/internal/status") {
+    if (req.method !== "GET") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
+    return sendJson(res, { protocol: SHARED_SERVICE_PROTOCOL, serviceId });
+  }
+
+  const bodyLimit = pathname === "/internal/ingest" ? 2 * 1024 * 1024 : 16 * 1024;
+  if (!["/internal/register", "/internal/heartbeat", "/internal/unregister", "/internal/ingest"].includes(pathname)) {
+    return send(res, 404, "Not Found", "text/plain; charset=utf-8");
+  }
+  if (req.method !== "POST") return send(res, 405, "Method Not Allowed", "text/plain; charset=utf-8");
+  const parsed = await readJsonBody(req, bodyLimit);
+  if (!parsed.ok) return send(res, parsed.status, parsed.message, "text/plain; charset=utf-8");
+
+  try {
+    if (pathname === "/internal/register") {
+      return sendJson(res, plane.register(parsed.value));
+    }
+    const body = parsed.value && typeof parsed.value === "object" && !Array.isArray(parsed.value)
+      ? parsed.value as Record<string, unknown>
+      : undefined;
+    if (!body || typeof body.clientId !== "string" || body.clientId.length === 0 || body.clientId.length > 128) {
+      return send(res, 400, "clientId must be a bounded non-empty string", "text/plain; charset=utf-8");
+    }
+    if (pathname === "/internal/heartbeat") {
+      return plane.heartbeat(body.clientId)
+        ? sendJson(res, { ok: true })
+        : send(res, 404, "Client registration not found", "text/plain; charset=utf-8");
+    }
+    if (pathname === "/internal/unregister") {
+      plane.unregister(body.clientId);
+      res.statusCode = 204;
+      return res.end();
+    }
+    if (!Array.isArray(body.events)) return send(res, 400, "events must be an array", "text/plain; charset=utf-8");
+    return sendJson(res, plane.ingest(body.clientId, body.events));
+  } catch (error) {
+    const candidate = error && typeof error === "object" ? (error as { statusCode?: unknown }).statusCode : undefined;
+    const status = candidate === 400 || candidate === 404 || candidate === 409 || candidate === 503 ? candidate : 400;
+    const message = error instanceof Error ? error.message : "Invalid request";
+    return send(res, status, message, "text/plain; charset=utf-8");
+  }
+}
+
+async function readJsonBody(
+  req: http.IncomingMessage,
+  maxBytes: number,
+): Promise<{ ok: true; value: unknown } | { ok: false; status: 400 | 413; message: string }> {
+  const declaredLength = req.headers["content-length"];
+  if (typeof declaredLength === "string" && /^\d+$/.test(declaredLength) && BigInt(declaredLength) > BigInt(maxBytes)) {
+    req.resume();
+    return { ok: false, status: 413, message: "Request body too large" };
+  }
+  return await new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const settle = (result: { ok: true; value: unknown } | { ok: false; status: 400 | 413; message: string }): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    req.on("data", (chunk: Buffer | string) => {
+      if (settled) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxBytes) {
+        chunks.length = 0;
+        settle({ ok: false, status: 413, message: "Request body too large" });
+        req.resume();
+      } else {
+        chunks.push(buffer);
+      }
+    });
+    req.on("end", () => {
+      if (settled) return;
+      if (bytes === 0) return settle({ ok: false, status: 400, message: "JSON body required" });
+      try {
+        settle({ ok: true, value: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      } catch {
+        settle({ ok: false, status: 400, message: "Invalid JSON" });
+      }
+    });
+    req.on("error", () => settle({ ok: false, status: 400, message: "Request body could not be read" }));
   });
 }
 

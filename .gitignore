@@ -15,6 +15,7 @@ examples/
 # Playwright / fixture dumps. Keep the fixture runner itself.
 test-results/*
 !test-results/serve-fixture.mts
+!test-results/serve-workspaces.mts
 
 # Vite leftovers, but ship dist/web so `pi install git:...` has the dashboard.
 /dist/*

@@ -47,7 +47,7 @@ describe("timeline controls", () => {
     expect(slider(host).value).toBe("0");
     act(() => { reviewButton(host).click(); });
     expect(onCursor).toHaveBeenCalledWith(0);
-    expect(host.querySelector(".timeline-foot .mono")?.textContent).toBe("NOW / FOLLOWING");
+    expect(host.querySelector(".timeline-foot .mono")?.textContent).toBe("NOW / FOLLOWING RECORDED ORDER");
   });
 
   it("refuses review and replay while the window is empty", () => {
@@ -76,6 +76,15 @@ describe("timeline controls", () => {
     expect(onCursor).toHaveBeenLastCalledWith(undefined);
     expect(onPlay).toHaveBeenCalledTimes(1);
     expect(host.isConnected).toBe(true);
+  });
+
+  it("labels the recent window as recorded event order", () => {
+    const { host } = show([event(2), event(1)], 1);
+
+    expect(host.querySelector(".timeline-title")?.textContent).toContain("RECORDED EVENT ORDER");
+    expect(host.querySelector(".timeline-title")?.textContent).toContain("2 in window");
+    expect(host.querySelector(".timeline-foot .mono")?.textContent).toContain("RECORDED ORDER");
+    expect(host.querySelector<HTMLInputElement>("input[type=range]")?.getAttribute("aria-label")).toBe("Replay event position in recorded order");
   });
 });
 

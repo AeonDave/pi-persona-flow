@@ -9,6 +9,7 @@ validate independently of producers. README documents the contract and local tru
 - `npm run typecheck:all`, `npm run test:all`, `npm run build`.
 - Audit both roots: `npm audit --audit-level=low`, `npm --prefix web audit --audit-level=low`.
 - One backend test: `node --import tsx --import ./test/setup/hermetic-env.ts --test test/<name>.test.ts`.
+- Installed Pi 1.3: `node --import tsx scripts/qualify-host.mjs <absolute-pi-package-root> [<absolute-pi-persona-extension-path>]`.
 
 ## Invariants
 
@@ -18,7 +19,16 @@ validate independently of producers. README documents the contract and local tru
 - Preserve stream identity `(producerId, sessionId)` and the producer/consumer parity corpus.
 - A stale stream is a consumer liveness notice, not a failed worker. Preserve recorded agent/tool
   status and replay history; agent/tool-only producers must age out too.
-- Pending starts share one promise; stop/session replacement invalidates and closes late listeners.
+- Pending attachments share one promise; stop/session replacement invalidates and closes late clients.
+- Top-level sessions attach to Flow by default. `--no-flow` prevents this run's viewer attachment,
+  not another plugin's telemetry production or file visibility to another enabled viewer;
+  never retain the old `--flow` opt-in. Dedicated worker markers skip registration entirely.
+- Autostart does not open a browser. Headless automatic announcements use stderr, not protocol stdout.
+- Independent Pi instances share one detached local service per agent directory. Follow the binding
+  lifecycle/control contract in `docs/SHARED_SERVICE.md`; Pi adapters never own the service lifetime.
+  File aggregation stays workspace scoped; Exocom never grants another workspace's filesystem data.
+- Replay is recorded ingestion order, not synchronized source timestamps. Counts are retained-window
+  counts. Never invent successful/stopped status or global event totals from incomplete observations.
 - Loopback only, bounded SSE and file ingestion, no body/prompt/argument/path/secret telemetry.
 - No idle animation loop. Respect reduced motion, and avoid duplicate Pi footer updates.
 - Pure TS must be erasable. Use platform-neutral paths and newline handling; never shell URLs through
@@ -29,3 +39,5 @@ validate independently of producers. README documents the contract and local tru
 Fresh typecheck, backend/web suites, build, both audits and `npm pack --dry-run`. Exercise the real Pi
 SDK tests and the compiled dashboard, not only mocks. Rebuild tracked `dist/web` after final web edits.
 Tests use an isolated Pi profile; never read or mutate the operator's memory, auth or telemetry.
+Join owned writers/listeners/clients before removing exact temporary roots; fixture directories
+must be cleaned on success and failure, including on Windows. Never bulk-delete the system temp root.
