@@ -180,11 +180,14 @@ test("TelemetryTailer reads v1 logs under both the pre- and post-rename storage 
   const tailer = new TelemetryTailer({ store, agentDir: f.agentDir, workspaceId: f.workspaceId, pollMs: 0 });
   const renamed = join(f.agentDir, "persona", "flow", f.workspaceId);
   mkdirSync(renamed, { recursive: true });
-  writeFileSync(join(f.dir, "old.jsonl"), `${JSON.stringify({ ...event(f.workspaceId), sessionId: "pre-rename", id: "pre-rename:1" })}
-`);
-  writeFileSync(join(renamed, "new.jsonl"), `${JSON.stringify({ ...event(f.workspaceId), sessionId: "post-rename", id: "post-rename:1" })}
-`);
+  const legacyFile = join(f.dir, "old.jsonl");
+  const currentFile = join(renamed, "new.jsonl");
+  writeFileSync(legacyFile, `${JSON.stringify({ ...event(f.workspaceId), sessionId: "pre-rename", id: "pre-rename:1" })}\n`);
+  writeFileSync(currentFile, `${JSON.stringify({ ...event(f.workspaceId), sessionId: "post-rename", id: "post-rename:1" })}\n`);
   tailer.start();
+  // A scan is time/byte bounded; under concurrent suites one tick need not consume both roots.
+  drain(tailer, legacyFile);
+  drain(tailer, currentFile);
   const instances = store.snapshot().state.instances;
   assert.ok(instances["pi-persona::pre-rename"], "a log under the pre-rename storage root was dropped");
   assert.ok(instances["pi-persona::post-rename"], "a log under the post-rename storage root was dropped");

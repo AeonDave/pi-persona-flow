@@ -370,11 +370,14 @@ test("an explicit unknown stream workspace returns 404 even when the stream limi
   }
 });
 
-test("an idle daemon closes only after its configured quiet window and reports full cleanup", async () => {
+test("an idle daemon closes after its configured quiet window once the first client detaches", async () => {
   const agentDir = mkdtempSync(join(tmpdir(), "flow-shared-idle-"));
   const service = await startSharedService({ agentDir, port: 0, idleMs: 35 });
+  const attached = registration(agentDir, "idle", "client-idle");
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
+    assert.equal((await control(service, "/internal/register", attached)).status, 200);
+    assert.equal((await control(service, "/internal/unregister", { clientId: attached.clientId })).status, 204);
     await Promise.race([
       service.closed,
       new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error("service did not close while idle")), 1_000); }),

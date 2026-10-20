@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createExtension, browserLaunch, workspaceHash, type FlowExtensionOptions } from "../src/extension.ts";
+import { FLOW_SETTINGS_CHANNEL } from "../src/settings.ts";
 
 const url = "http://127.0.0.1:7874/?token=Ab12";
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -18,10 +20,12 @@ function mockPi(options: FlowExtensionOptions = {}, disabled = false) {
   const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
   const flags = new Map<string, unknown>();
   const subscriptions = new Map<string, (value: unknown) => void>();
+  const publicSubscriptions = new Map<string, Set<(value: unknown) => void>>();
   const widgets: string[] = [];
   const statuses: Array<string | undefined> = [];
   const notices: string[] = [];
   const published: unknown[][] = [];
+  const connectionOptions: unknown[] = [];
   let connections = 0;
   let closed = 0;
   const cwd = join(tmpdir(), "flow-mock-workspace");
@@ -38,7 +42,15 @@ function mockPi(options: FlowExtensionOptions = {}, disabled = false) {
     registerCommand: (name: string, def: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => { commands.set(name, def); },
     registerFlag: (name: string, def: unknown) => { flags.set(name, def); },
     getFlag: (name: string) => name === "no-flow" && disabled,
-    events: { on: (name: string, fn: (value: unknown) => void) => { subscriptions.set(name, fn); return () => { subscriptions.delete(name); }; } },
+    events: { on: (name: string, fn: (value: unknown) => void) => {
+      if (name === "pi:telemetry" || name === "pi:telemetry:v1") {
+        subscriptions.set(name, fn);
+        return () => { subscriptions.delete(name); };
+      }
+      const handlers = publicSubscriptions.get(name) ?? new Set<(value: unknown) => void>();
+      handlers.add(fn); publicSubscriptions.set(name, handlers);
+      return () => { handlers.delete(fn); if (handlers.size === 0) publicSubscriptions.delete(name); };
+    } },
   } as unknown as ExtensionAPI;
   const connection = {
     url, workspaceId: workspaceHash(cwd),
@@ -46,17 +58,43 @@ function mockPi(options: FlowExtensionOptions = {}, disabled = false) {
     close: async () => { closed += 1; },
   };
   createExtension(api, {
-    connect: async () => { connections += 1; return connection; }, flushMs: 1,
+    connect: async (connectOptions) => { connections += 1; connectionOptions.push(connectOptions); return connection; }, flushMs: 1,
     ...options,
   });
   return {
-    handlers, commands, flags, subscriptions, widgets, statuses, notices, published, context, connection,
+    handlers, commands, flags, subscriptions, publicSubscriptions, widgets, statuses, notices, published, connectionOptions, context, connection,
     get connections() { return connections; }, get closed() { return closed; },
     start: async (ctx = context) => { await (handlers.get("session_start") as (event: unknown, ctx: ExtensionContext) => Promise<void>)({}, ctx); },
     stop: async () => { await (handlers.get("session_shutdown") as () => Promise<void>)(); },
     command: async (arg: string) => { await commands.get("dashboard")!.handler(arg, context); },
     emit: (value: unknown, channel = "pi:telemetry") => { subscriptions.get(channel)?.(value); },
+    collectSettings: () => {
+      const values: Array<{ id: string; settings: unknown }> = [];
+      for (const handler of publicSubscriptions.get(FLOW_SETTINGS_CHANNEL) ?? []) {
+        handler({ add: (id: string, settings: unknown) => values.push({ id, settings }) });
+      }
+      return values;
+    },
   };
+}
+
+async function withFlowSettings<T>(preferences: Record<string, unknown>, run: (agentDir: string) => Promise<T>): Promise<T> {
+  const root = await mkdtemp(join(tmpdir(), "pi-flow-settings-extension-"));
+  const agentDir = join(root, "agent");
+  const previousAgentDir = process.env.PI_AGENT_DIR;
+  const personaDir = join(agentDir, "persona");
+  try {
+    await mkdir(personaDir, { recursive: true });
+    await writeFile(join(personaDir, "settings.json"), JSON.stringify({ version: 1, preferences, personas: {}, lastPersona: null }), "utf8");
+    process.env.PI_AGENT_DIR = agentDir;
+    return await run(agentDir);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_AGENT_DIR;
+    else process.env.PI_AGENT_DIR = previousAgentDir;
+    assert.equal(dirname(resolve(root)), resolve(tmpdir()));
+    assert.ok(basename(root).startsWith("pi-flow-settings-extension-"));
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 }
 function event(seq: number, workspaceId = workspaceHash(join(tmpdir(), "flow-mock-workspace"))) {
   return { version: 2, producerId: "test", producerVersion: "1", id: `s:${seq}`, seq, ts: seq,
@@ -134,6 +172,94 @@ test("--no-flow creates no attachment/subscriptions, including on manual serve",
   assert.equal(m.subscriptions.size, 0);
   assert.deepEqual(m.widgets, []);
   assert.match(m.notices.join(""), /--no-flow/);
+});
+
+test("saved Flow preferences are snapshotted at activation and can disable default startup attachment", async () => {
+  await withFlowSettings({ flowEnabled: false, flowPort: 8123, flowIdleMs: 2500 }, async (agentDir) => {
+    const m = mockPi();
+    // Changing the file after extension activation must not alter this runtime's snapshot.
+    await writeFile(join(agentDir, "persona", "settings.json"), JSON.stringify({ version: 1, preferences: { flowEnabled: true, flowPort: 9234, flowIdleMs: 3000 } }), "utf8");
+    await m.start();
+    try {
+      assert.equal(m.connections, 0, "flowEnabled=false must prevent the default service attachment");
+      assert.deepEqual(m.collectSettings(), [{ id: "flow", settings: { flowEnabled: false, flowPort: 8123, flowIdleMs: 2500 } }]);
+    } finally { await m.stop(); }
+  });
+});
+
+test("invalid saved preferences warn once at session_start, including headless startup", async () => {
+  await withFlowSettings({ flowEnabled: true, flowPort: 8123, flowIdleMs: "unsafe" }, async () => {
+    const m = mockPi();
+    const written: string[] = [], errors: string[] = [];
+    const stdout = process.stdout.write, stderr = process.stderr.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => { if (typeof chunk !== "string") return stdout.call(process.stdout, chunk); written.push(chunk); return true; }) as typeof stdout;
+    process.stderr.write = ((chunk: string | Uint8Array) => { if (typeof chunk !== "string") return stderr.call(process.stderr, chunk); errors.push(chunk); return true; }) as typeof stderr;
+    try {
+      await m.start({ ...m.context, hasUI: false });
+      await m.stop();
+      await m.start({ ...m.context, hasUI: false });
+      assert.equal(m.connections, 2, "invalid idle preference falls back rather than disabling Flow");
+    } finally {
+      process.stdout.write = stdout;
+      process.stderr.write = stderr;
+      await m.stop();
+    }
+    assert.deepEqual(written, []);
+    assert.equal(errors.filter((text) => text.includes("saved flowIdleMs preference is invalid")).length, 1);
+    assert.match(errors.join(""), /flow dashboard at/);
+  });
+});
+
+test("environment config contributes the effective default while --no-flow still prevents attachment", async () => {
+  await withFlowSettings({ flowEnabled: true, flowPort: 8123, flowIdleMs: 2500 }, async () => {
+    const previousPort = process.env.PI_PERSONA_FLOW_PORT;
+    const previousIdle = process.env.PI_PERSONA_FLOW_IDLE_MS;
+    process.env.PI_PERSONA_FLOW_PORT = "9123";
+    process.env.PI_PERSONA_FLOW_IDLE_MS = "3500";
+    try {
+      const m = mockPi({}, true);
+      await m.start();
+      await m.command("serve");
+      assert.equal(m.connections, 0, "--no-flow wins even when the configured default is enabled");
+      assert.deepEqual(m.collectSettings(), [{ id: "flow", settings: { flowEnabled: true, flowPort: 9123, flowIdleMs: 3500 } }],
+        "the public settings collector reports resolved defaults before applying this run's --no-flow opt-out");
+      assert.equal(m.publicSubscriptions.get(FLOW_SETTINGS_CHANNEL)?.size, 1, "settings collection uses one listener, not a timer or per-render registration");
+      await m.stop();
+      assert.equal(m.publicSubscriptions.has(FLOW_SETTINGS_CHANNEL), false, "the public listener is unregistered on shutdown");
+      await m.start();
+      assert.equal(m.publicSubscriptions.get(FLOW_SETTINGS_CHANNEL)?.size, 1, "a later lifecycle start re-registers exactly one listener");
+      await m.stop();
+    } finally {
+      if (previousPort === undefined) delete process.env.PI_PERSONA_FLOW_PORT; else process.env.PI_PERSONA_FLOW_PORT = previousPort;
+      if (previousIdle === undefined) delete process.env.PI_PERSONA_FLOW_IDLE_MS; else process.env.PI_PERSONA_FLOW_IDLE_MS = previousIdle;
+    }
+  });
+});
+
+test("saved port and idle preferences reach the next Flow service start", async () => {
+  await withFlowSettings({ flowEnabled: true, flowPort: 8234, flowIdleMs: 1_250 }, async () => {
+    const previousPort = process.env.PI_PERSONA_FLOW_PORT;
+    const previousIdle = process.env.PI_PERSONA_FLOW_IDLE_MS;
+    delete process.env.PI_PERSONA_FLOW_PORT;
+    delete process.env.PI_PERSONA_FLOW_IDLE_MS;
+    try {
+      const m = mockPi();
+      await m.start();
+      try {
+        assert.deepEqual(m.connectionOptions[0], {
+          agentDir: process.env.PI_AGENT_DIR,
+          cwd: m.context.cwd,
+          sessionId: "mock-session",
+          port: 8234,
+          idleMs: 1_250,
+          signal: (m.connectionOptions[0] as { signal?: AbortSignal }).signal,
+        });
+      } finally { await m.stop(); }
+    } finally {
+      if (previousPort === undefined) delete process.env.PI_PERSONA_FLOW_PORT; else process.env.PI_PERSONA_FLOW_PORT = previousPort;
+      if (previousIdle === undefined) delete process.env.PI_PERSONA_FLOW_IDLE_MS; else process.env.PI_PERSONA_FLOW_IDLE_MS = previousIdle;
+    }
+  });
 });
 
 for (const marker of ["PI_PERSONA_LEG", "PI_PERSONA_CHILD"] as const) {

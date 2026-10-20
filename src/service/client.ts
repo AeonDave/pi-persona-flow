@@ -29,6 +29,8 @@ export interface ConnectFlowServiceOptions {
 	cwd: string;
 	sessionId: string;
 	port?: number;
+	/** Desired idle window for a daemon started by this call; an existing service is never changed. */
+	idleMs?: number;
 	signal?: AbortSignal;
 }
 
@@ -77,7 +79,13 @@ export async function connectFlowService(options: ConnectFlowServiceOptions): Pr
 		cwd,
 		label: safeWorkspaceLabel(cwd),
 	};
-	const descriptor = await ensureService({ directory, agentDir, port, signal: options.signal });
+	const descriptor = await ensureService({
+		directory,
+		agentDir,
+		port,
+		...(options.idleMs !== undefined ? { idleMs: options.idleMs } : {}),
+		...(options.signal ? { signal: options.signal } : {}),
+	});
 	throwIfAborted(options.signal);
 	try {
 		const result = await registerClient(descriptor, registration, options.signal);
@@ -130,6 +138,9 @@ export async function connectFlowService(options: ConnectFlowServiceOptions): Pr
 function validateOptions(options: ConnectFlowServiceOptions): void {
 	if (!path.isAbsolute(options.agentDir)) throw new TypeError("agentDir must be absolute");
 	if (!path.isAbsolute(options.cwd)) throw new TypeError("cwd must be absolute");
+	if (options.idleMs !== undefined && (!Number.isSafeInteger(options.idleMs) || options.idleMs < 50 || options.idleMs > 60_000)) {
+		throw new RangeError("idleMs must be an integer from 50 to 60000");
+	}
 	if (typeof options.sessionId !== "string" || options.sessionId.length < 1 || options.sessionId.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(options.sessionId)) {
 		throw new TypeError("sessionId must be a bounded non-empty string");
 	}
@@ -153,6 +164,7 @@ async function ensureService(input: {
 	directory: string;
 	agentDir: string;
 	port: number;
+	idleMs?: number;
 	signal?: AbortSignal;
 }): Promise<SharedServiceDescriptor> {
 	const deadline = Date.now() + STARTUP_TIMEOUT_MS;
@@ -191,7 +203,7 @@ async function ensureService(input: {
 }
 
 async function startUnderLock(
-	input: { directory: string; agentDir: string; port: number; signal?: AbortSignal },
+	input: { directory: string; agentDir: string; port: number; idleMs?: number; signal?: AbortSignal },
 	descriptorPath: string,
 	deadline: number,
 ): Promise<SharedServiceDescriptor> {
@@ -206,7 +218,7 @@ async function startUnderLock(
 		await removeDescriptorIfSame(descriptorPath, existing);
 	}
 
-	const childState = spawnDaemon(input.agentDir, input.port);
+	const childState = spawnDaemon(input.agentDir, input.port, input.idleMs);
 	try {
 		while (Date.now() < deadline) {
 			throwIfAborted(input.signal);
@@ -375,17 +387,20 @@ async function removeDescriptorIfSame(file: string, expected: SharedServiceDescr
 	});
 }
 
-function spawnDaemon(agentDir: string, port: number): ChildState {
+function spawnDaemon(agentDir: string, port: number, idleMs?: number): ChildState {
 	const nodeExecutable = isNodeExecutable(process.execPath) ? process.execPath : "node";
 	const env: NodeJS.ProcessEnv = {};
 	for (const key of ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "COMSPEC"]) {
 		const value = process.env[key];
 		if (value !== undefined) env[key] = value;
 	}
-	// The test harness uses a bounded short idle interval to prove that the detached child owns
-	// cleanup. Normal sessions inherit no arbitrary PI, auth, NODE_OPTIONS or model credentials.
-	const idleOverride = process.env.PI_PERSONA_FLOW_IDLE_MS;
-	if (idleOverride !== undefined) env.PI_PERSONA_FLOW_IDLE_MS = idleOverride;
+	// An explicit desired idle policy configures only a daemon started by this call. Normal sessions
+	// inherit no arbitrary PI, auth, NODE_OPTIONS or model credentials.
+	if (idleMs !== undefined) env.PI_PERSONA_FLOW_IDLE_MS = String(idleMs);
+	else {
+		const idleOverride = process.env.PI_PERSONA_FLOW_IDLE_MS;
+		if (idleOverride !== undefined) env.PI_PERSONA_FLOW_IDLE_MS = idleOverride;
+	}
 	const child = spawn(nodeExecutable, ["--experimental-strip-types", ENTRY_PATH, agentDir, String(port)], {
 		cwd: agentDir,
 		detached: true,

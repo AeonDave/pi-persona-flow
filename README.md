@@ -26,7 +26,7 @@ pi install git:github.com/AeonDave/pi-persona-flow
 For a reproducible install of this stable release, pin the tag:
 
 ```bash
-pi install git:github.com/AeonDave/pi-persona-flow@v0.3.0
+pi install git:github.com/AeonDave/pi-persona-flow@v0.3.1
 ```
 
 Restart Pi or run `/reload`. Flow attaches to one shared local service automatically,
@@ -72,11 +72,19 @@ cannot authenticate the API. The launch code is random, case-sensitive and chang
 the server restarts.
 
 Default port: `7874`; set `PI_PERSONA_FLOW_PORT` to override it (`0` asks the OS for a port).
-If the requested port is occupied, Flow chooses an available loopback port and announces it.
+When pi-persona is installed, Flow also reads its version-1 `persona/settings.json` preferences
+without writing them: `flowEnabled` controls automatic attachment, `flowPort` selects the desired
+port and `flowIdleMs` (50–60,000; default 60,000) selects the desired idle grace. The existing
+`PI_PERSONA_FLOW_PORT` and `PI_PERSONA_FLOW_IDLE_MS` environment variables override saved values.
+`flowEnabled: false` disables automatic attachment, not an explicit `/dashboard serve`; `--no-flow`
+always opts that Pi run out. Port and idle choices apply only when a new shared service starts,
+never to one already running. If the requested port is occupied, Flow chooses an available loopback port and announces it.
 Simultaneous starts elect **one detached service per Pi agent directory**, with one URL and
 launch code. Closing the first Pi, or running `/dashboard stop`, does not stop the others.
-The service exits after 60 seconds with no attached Pi sessions and no dashboard SSE connections;
-an open dashboard can keep retained work available for review. No OS-wide daemon is installed.
+On first startup, the service allows up to 15 seconds for its first authenticated client; this lets
+even a short idle preference survive a slow cold start. After a client has connected, the service
+exits after the configured idle grace with no attached Pi sessions and no dashboard SSE connections.
+An open dashboard keeps the service alive and can review retained work. No OS-wide daemon is installed.
 Delegated workers do not attach as extra supervisors. Headless autostart announces its URL on
 stderr, keeping JSON/RPC/print stdout clean. If the service becomes unavailable, the Pi footer
 reports it; `/dashboard serve` reconnects.

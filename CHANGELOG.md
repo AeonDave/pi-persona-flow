@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## [0.3.1](https://github.com/AeonDave/pi-persona-flow/compare/v0.3.0...v0.3.1) - 2026-10-20
+
+- Read Flow's public attachment, port and idle preferences from pi-persona's version-1
+  `persona/settings.json` without writing it or importing the producer runtime. Existing Flow port
+  and idle environment variables still override saved values; `--no-flow` remains the per-run opt-out.
+- Pass the desired idle grace only to a newly started shared service and give it a bounded startup
+  grace to authenticate its first client, so short idle preferences cannot race cold startup.
+- Warn once and use bounded defaults for malformed Flow settings rather than silently ignoring them.
+
 ## [0.3.0](https://github.com/AeonDave/pi-persona-flow/compare/v0.3.0-rc.1...v0.3.0) - 2026-10-19
 
 - Promote the qualified `0.3.0-rc.1` candidate to stable. No production behavior changed; the

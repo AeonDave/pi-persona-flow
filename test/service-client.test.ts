@@ -173,6 +173,42 @@ test("parallel Pi attachments share one service, preserve workspace registration
 	}
 });
 
+test("explicit idleMs configures only a newly started daemon and never rewrites the parent environment", { timeout: 15_000 }, async () => {
+	const { root, agentDir } = await temporaryAgentDir();
+	const previousIdle = process.env.PI_PERSONA_FLOW_IDLE_MS;
+	process.env.PI_PERSONA_FLOW_IDLE_MS = "60000";
+	const attachments: Array<Awaited<ReturnType<typeof connectFlowService>>> = [];
+	let descriptor: SharedServiceDescriptor | undefined;
+	try {
+		const first = await connectFlowService({ agentDir, cwd: root, sessionId: "explicit-idle-first", port: 0, idleMs: 1_000 });
+		attachments.push(first);
+		descriptor = await readDescriptor(agentDir);
+		assert.equal(process.env.PI_PERSONA_FLOW_IDLE_MS, "60000", "the parent process environment must remain unchanged");
+
+		const second = await connectFlowService({ agentDir, cwd: join(root, "other-workspace"), sessionId: "explicit-idle-second", port: 9_999, idleMs: 250 });
+		attachments.push(second);
+		assert.equal(second.url, first.url, "a changed desired port must not restart or hijack the already-running shared service");
+		assert.equal((await readDescriptor(agentDir)).serviceId, descriptor.serviceId, "existing service identity must remain stable");
+
+		await second.close();
+		await first.close();
+		await waitUntil(async () => {
+			try { await readFile(descriptorPath(agentDir)); return false; }
+			catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; }
+		}, "the daemon to honor the explicit child idle window", 5_000);
+		await waitUntil(async () => !processIsAlive(descriptor!.pid), "the explicit-idle daemon to exit", 5_000);
+	} finally {
+		for (const attachment of attachments) await attachment.close().catch(() => undefined);
+		if (descriptor && processIsAlive(descriptor.pid)) {
+			try { process.kill(descriptor.pid, "SIGTERM"); } catch { /* already exited */ }
+			await waitUntil(async () => !processIsAlive(descriptor!.pid), "the isolated explicit-idle test daemon to exit", 5_000).catch(() => undefined);
+		}
+		if (previousIdle === undefined) delete process.env.PI_PERSONA_FLOW_IDLE_MS;
+		else process.env.PI_PERSONA_FLOW_IDLE_MS = previousIdle;
+		await removeTemporaryRoot(root);
+	}
+});
+
 test("cancellation while another live Pi owns startup does not remove its lock or register", async () => {
 	const { root, agentDir } = await temporaryAgentDir();
 	const lock = serviceLockPath(agentDir);

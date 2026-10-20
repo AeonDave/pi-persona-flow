@@ -62,7 +62,7 @@ register after cancellation; an already-started shared service can exit through 
 Backend API: `startSharedService({ agentDir, port, ...testLimits })` resolves a descriptor plus
 `close()` and `clientCount()`; it starts one multiplexing HTTP server. The entrypoint persists the
 descriptor and awaits the service lifecycle. Client API:
-`connectFlowService({ agentDir, cwd, sessionId, port?, signal? })` returns
+`connectFlowService({ agentDir, cwd, sessionId, port?, idleMs?, signal? })` returns
 `{ url, workspaceId, heartbeat(): Promise<void>, publish(events: readonly unknown[]): Promise<void>, close(): Promise<void> }`.
 Close unregisters only that client, never kills the shared service. A 404 heartbeat re-registers a
 still-live attachment. Transport failures are non-fatal to Pi, but visible and bounded.
@@ -80,6 +80,16 @@ scope. `--no-flow` prevents this run from starting/registering with the viewer; 
 producer telemetry or hide workspace logs from another enabled viewer. Producer opt-outs are separate.
 Dedicated worker markers skip Flow registration. A user-set `PI_PERSONA_DISABLE` is not a worker.
 
+Flow optionally reads `flowEnabled`, `flowPort`, and `flowIdleMs` from the version-1
+`<agentDir>/persona/settings.json` `preferences` object at extension activation. This is a read-only
+consumer; it does not import the producer runtime or write the shared file. Defaults are enabled,
+port 7874, and a 60-second idle grace. `PI_PERSONA_FLOW_PORT` and `PI_PERSONA_FLOW_IDLE_MS` override
+the corresponding saved values. `flowEnabled: false` suppresses automatic attachment only; an
+explicit `/dashboard serve` may still attach, while `--no-flow` always opts that Pi run out. The
+resolved port and idle grace are desired settings for a newly started service: an already-running
+shared service is never restarted or reconfigured. Direct client callers may pass `idleMs` (50–60,000)
+to configure only a daemon started by that call.
+
 Clients heartbeat every 5 seconds; a 20-second lease expires crashed/disconnected clients. PID checks
 are conservative (`ESRCH` proves death, permission/unknown does not). SDK sessions in the same process
 have separate client IDs. Unregistering or expiry updates workspace active counts immediately;
@@ -88,8 +98,12 @@ stores (32) and active client registrations (256), never evict an active workspa
 active registrations clearly, and retire
 inactive stores first. Existing EventStore bounds remain in force per workspace.
 
-With no registrations and no browser SSE clients, idle shutdown occurs after 60 seconds. An open
-browser may continue reviewing recorded work. No automatic browser-tab spawning is added: open the
+At initial startup, Flow waits up to 15 seconds for a first authenticated client, independently of
+the desired idle grace, so short settings do not race the Pi client's 10-second startup deadline.
+If no client ever connects, the daemon still exits after that bounded grace. After any Pi or browser
+client has connected, idle shutdown occurs after the configured grace (60 seconds by default) with
+no registrations and no browser SSE clients. An open browser SSE connection keeps the service alive,
+so the idle grace is not a hard lifetime cap while a dashboard remains connected. No automatic browser-tab spawning is added: open the
 shared page once with `/dashboard`, then leave it connected. `/dashboard stop` detaches this run only;
 `serve` reattaches it unless `--no-flow` was supplied. `/dashboard status` prints the shared URL.
 

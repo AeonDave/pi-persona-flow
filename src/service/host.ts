@@ -2,7 +2,12 @@ import * as crypto from "node:crypto";
 
 import { SHARED_SERVICE_PROTOCOL, type SharedServiceDescriptor } from "../../shared/workspaces.ts";
 import { startServer, type FlowServer } from "../server.ts";
+import { createIdleShutdownPolicy } from "./idle-shutdown.ts";
 import { WorkspaceRegistry } from "./registry.ts";
+
+// The Pi client waits up to 10 seconds for an authenticated service. Leave headroom for a slow
+// cold start before a short user idle preference begins to apply.
+const STARTUP_GRACE_MS = 15_000;
 
 export interface SharedServiceOptions {
   agentDir: string;
@@ -37,21 +42,15 @@ export async function startSharedService(options: SharedServiceOptions): Promise
   const serviceId = crypto.randomUUID();
   const controlToken = crypto.randomBytes(32).toString("base64url");
   let server: FlowServer | undefined;
+  let idlePolicy: ReturnType<typeof createIdleShutdownPolicy> | undefined;
   let closing = false;
   let closePromise: Promise<void> | undefined;
-  let idleSince = Date.now();
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
 
   const checkIdle = (): void => {
-    if (closing || !server) return;
-    const active = registry.clientCount > 0 || server.clientCount() > 0;
-    if (active) {
-      idleSince = 0;
-      return;
-    }
-    if (idleSince === 0) idleSince = Date.now();
-    if (Date.now() - idleSince >= idleMs) void close();
+    if (closing || !server || !idlePolicy) return;
+    if (idlePolicy.shouldClose(Date.now(), registry.clientCount, server.clientCount())) void close();
   };
 
   const registry = new WorkspaceRegistry({
@@ -88,6 +87,8 @@ export async function startSharedService(options: SharedServiceOptions): Promise
     resolveClosed();
     throw error;
   }
+
+  idlePolicy = createIdleShutdownPolicy(idleMs, STARTUP_GRACE_MS, Date.now());
 
   const lifecycleSweep = setInterval(() => {
     if (closing) return;

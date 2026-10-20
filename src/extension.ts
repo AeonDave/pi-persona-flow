@@ -4,6 +4,7 @@ import { LEGACY_TELEMETRY_EVENT_NAME, parseTelemetryEvent, TELEMETRY_EVENT_NAME 
 import { connectFlowService } from "./service/client.ts";
 import { workspaceHash } from "./tailer.ts";
 import { isSupportedPiVersion, MIN_PI_VERSION } from "./pi-compat.ts";
+import { FLOW_SETTINGS_CHANNEL, readFlowSettings } from "./settings.ts";
 
 type Connection = Awaited<ReturnType<typeof connectFlowService>>;
 export interface FlowExtensionOptions {
@@ -18,6 +19,9 @@ export default function piPersonaFlow(pi: ExtensionAPI): void { createExtension(
 export function createExtension(pi: ExtensionAPI, options: FlowExtensionOptions = {}): void {
   if (!isSupportedPiVersion(VERSION)) throw new Error(`pi-persona-flow requires Pi ${MIN_PI_VERSION}+ (found ${VERSION}).`);
   if (process.env.PI_PERSONA_LEG === "1" || process.env.PI_PERSONA_CHILD === "1") return;
+  const agentDir = process.env.PI_AGENT_DIR || getAgentDir();
+  const settingsWarnings: string[] = [];
+  const flowSettings = readFlowSettings(agentDir, process.env, settingsWarnings);
   const connect = options.connect ?? connectFlowService;
   const heartbeatMs = options.heartbeatMs ?? 5_000;
   const flushMs = options.flushMs ?? 10;
@@ -42,7 +46,33 @@ export function createExtension(pi: ExtensionAPI, options: FlowExtensionOptions 
   };
   let active: Attachment | undefined;
   let generation = 0;
+  let settingsWarningsReported = false;
   const disabled = (): boolean => pi.getFlag("no-flow") === true;
+  let unsubscribeSettings: (() => void) | undefined;
+  const collectSettings = (value: unknown): void => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+    const add = (value as { add?: unknown }).add;
+    if (typeof add !== "function") return;
+    try {
+      add.call(value, "flow", {
+        flowEnabled: flowSettings.flowEnabled,
+        flowPort: flowSettings.flowPort,
+        flowIdleMs: flowSettings.flowIdleMs,
+      });
+    } catch {
+      /* A companion settings view is optional and must not break Flow attachment. */
+    }
+  };
+  const registerSettingsContribution = (): void => {
+    if (unsubscribeSettings) return;
+    unsubscribeSettings = pi.events.on(FLOW_SETTINGS_CHANNEL, collectSettings);
+  };
+  const unregisterSettingsContribution = (): void => {
+    const unsubscribe = unsubscribeSettings;
+    unsubscribeSettings = undefined;
+    unsubscribe?.();
+  };
+  registerSettingsContribution();
 
   function report(ctx: ExtensionContext, text: string, warning = false, automatic = false): void {
     if (ctx.hasUI) { try { ctx.ui.notify(text, warning ? "warning" : "info"); } catch { /* UI teardown */ } }
@@ -146,13 +176,14 @@ export function createExtension(pi: ExtensionAPI, options: FlowExtensionOptions 
     };
     active = a;
     subscribe(a);
-    const portValue = process.env.PI_PERSONA_FLOW_PORT ?? "";
-    const port = /^\d+$/.test(portValue) && Number(portValue) <= 65_535 ? Number(portValue) : 7874;
     const opening = (async () => {
       try {
         const connection = await connect({
-          agentDir: process.env.PI_AGENT_DIR || getAgentDir(), cwd: ctx.cwd,
-          sessionId: ctx.sessionManager.getSessionId(), port, signal: a.controller.signal,
+          agentDir, cwd: ctx.cwd,
+          sessionId: ctx.sessionManager.getSessionId(),
+          port: flowSettings.flowPort,
+          idleMs: flowSettings.flowIdleMs,
+          signal: a.controller.signal,
         });
         if (a.closed || active !== a) { await connection.close(); return undefined; }
         a.connection = connection; a.healthy = true;
@@ -173,15 +204,21 @@ export function createExtension(pi: ExtensionAPI, options: FlowExtensionOptions 
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    registerSettingsContribution();
     const epoch = ++generation;
     const previous = active; active = undefined;
     await detach(previous);
-    if (generation !== epoch || disabled()) return;
+    if (!settingsWarningsReported && settingsWarnings.length > 0) {
+      settingsWarningsReported = true;
+      report(ctx, `pi-persona-flow: ${settingsWarnings.join(" ")}`, true, true);
+    }
+    if (generation !== epoch || disabled() || !flowSettings.flowEnabled) return;
     await attach(ctx);
     if (generation === epoch && active) announce(active, true);
   });
   pi.on("session_shutdown", async () => {
     ++generation;
+    unregisterSettingsContribution();
     const previous = active; active = undefined;
     await detach(previous);
   });
