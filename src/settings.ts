@@ -137,10 +137,11 @@ function readCanonicalFile(file: string, agentDir: string, warnings?: string[]):
 			return undefined;
 		}
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			warn(warnings, "The canonical settings file could not be read; Flow defaults were used.");
-		} else {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") {
 			hasInvalidParent(agentDir, warnings);
+		} else {
+			warn(warnings, "The canonical settings file could not be read; Flow defaults were used.");
 		}
 		return undefined;
 	} finally {
