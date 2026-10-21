@@ -25,7 +25,12 @@ service. It never accepts an arbitrary agent directory from a browser request.
 
 - `GET /api/workspaces`: browser-authenticated `WorkspaceCatalog`, no paths/control secrets.
 - `GET /api/snapshot?workspace=<id>`: only that workspace's EventStore and cursor.
-- `GET /api/stream?workspace=<id>&after=<cursor>`: only that workspace's snapshots/deltas.
+- `GET /api/stream?workspace=<id>&after=<cursor>&streamEpoch=<epoch>`: only that workspace's
+  snapshots/deltas. Shared-service snapshots carry an independent public `streamEpoch`; SSE event
+  IDs are `<epoch>:<cursor>`. An initial join forwards its HTTP snapshot's epoch; EventSource
+  reconnects with its last event ID. A missing or obsolete epoch forces an authoritative snapshot,
+  replacing the old graph and cursor before accepting events from the new daemon. Legacy standalone
+  servers retain numeric event IDs.
 - A missing workspace parameter uses the catalog default; an unknown explicit ID returns 404,
   never another workspace's data. Existing single-store server adapters expose one `local` workspace.
 - `GET /internal/status`: private control authentication, returns `{ protocol: 1, serviceId }`.
@@ -39,7 +44,7 @@ service. It never accepts an arbitrary agent directory from a browser request.
 
 Private routes require `x-pi-flow-control` with a random 256-bit token, reject browser Origin headers,
 bound JSON bodies (16 KiB) and bind only to 127.0.0.1. Browser read-only routes retain the existing
-four-character convenience gate and per-port cookie. Never expose the private descriptor or token
+four-character convenience gate and per-port cookie. Never expose the private descriptor or control token
 in browser responses, public URLs, telemetry, or logs. No wildcard CORS.
 
 `<agentDir>/persona-flow/service-v1/service.json` is a private atomic 0600 descriptor:
@@ -47,6 +52,13 @@ protocol, service ID/nonce, PID, browser URL, control token and start time. An a
 probe verifies the descriptor, not PID existence alone. Startup contenders share an exclusive
 `startup.lock` owned by PID+nonce; only a proven-dead owner can be reclaimed. Unknown/malformed
 owners fail closed with a bounded actionable diagnostic. No broad process killing or deletion.
+
+A separate private, atomic 0600 `<agentDir>/persona-flow/service-v1/browser.json` binding
+retains the browser launch code, desired port and actual bound loopback port across daemon replacements.
+With an unchanged desired port, a new daemon prefers this port and code so already-open browser pages keep their authenticated URL;
+if the port has been taken, normal loopback port fallback supplies a new URL which Pi announces.
+The browser binding is not control authentication: each daemon creates a fresh service ID and
+private control token. Malformed saved bindings are rejected rather than used as authentication data.
 
 The secondary `startup.lock.reclaim` guard is deliberately conservative after a crash: an unknown,
 malformed or proven-dead reclaimer fails closed rather than risking deletion of a new contender's
@@ -65,12 +77,22 @@ descriptor and awaits the service lifecycle. Client API:
 `connectFlowService({ agentDir, cwd, sessionId, port?, idleMs?, signal? })` returns
 `{ url, workspaceId, heartbeat(): Promise<void>, publish(events: readonly unknown[]): Promise<void>, close(): Promise<void> }`.
 Close unregisters only that client, never kills the shared service. A 404 heartbeat re-registers a
-still-live attachment. Transport failures are non-fatal to Pi, but visible and bounded.
-The Pi adapter batches bus delivery behind one in-flight request, bounds its queue by count/bytes,
-and retries an ambiguous delivery once with identical event IDs (safe under service deduplication).
-Shutdown drains the final bounded batch before unregistering. Exhausted delivery/overload is visible
-instead of growing without limit or claiming guaranteed delivery. Session generations discard late
-callbacks. Compatible bus-only producers should persist their own history if durable recovery matters.
+still-live attachment. Transport failures are non-fatal to Pi. Failed startup, heartbeat or bus delivery
+starts automatic reconnection with bounded exponential backoff; no operator command is required for
+ordinary service loss. Reconnection uses the same authenticated discovery and startup election as the
+first attachment, so it can reuse a live daemon or start a replacement without taking ownership of its
+lifetime. `/dashboard serve` can request an immediate attempt. Pending attachments and recovery share
+one connection attempt; stop, shutdown and session replacement cancel scheduled retries, invalidate
+late callbacks and close late connections. The Pi footer reports the interruption and restores the
+current authenticated link when connected.
+
+The Pi adapter batches bus delivery behind one in-flight request. Queued and in-flight events share
+one outstanding budget of 256 events / 1 MiB. An ambiguous delivery is retried with identical event
+IDs, including across reconnection, so service deduplication remains authoritative. Failed batches
+remain pending within that budget; excess events are dropped with a visible overload warning.
+Shutdown attempts the final bounded batch before unregistering, without scheduling further recovery.
+Delivery is not durable or guaranteed: file-backed history can be read again after recovery, while
+compatible bus-only producers should persist their own history if durable recovery matters.
 
 ## Lifetime and data
 
@@ -104,13 +126,19 @@ If no client ever connects, the daemon still exits after that bounded grace. Aft
 client has connected, idle shutdown occurs after the configured grace (60 seconds by default) with
 no registrations and no browser SSE clients. An open browser SSE connection keeps the service alive,
 so the idle grace is not a hard lifetime cap while a dashboard remains connected. No automatic browser-tab spawning is added: open the
-shared page once with `/dashboard`, then leave it connected. `/dashboard stop` detaches this run only;
-`serve` reattaches it unless `--no-flow` was supplied. `/dashboard status` prints the shared URL.
+shared page once with `/dashboard`, then leave it connected. `/dashboard stop` detaches this run only
+and cancels its automatic recovery; `serve` reattaches it unless `--no-flow` was supplied.
+`/dashboard status` prints the shared URL.
 
 The browser polls the small catalog every 2 seconds, preserves a valid workspace URL selection,
 and resets graph, filters, replay, selection and cursor on switching. Abort previous snapshot requests,
 close the old EventSource and ignore late callbacks; identical producer/session IDs in two workspaces
-must never mix. Use `useDashboard` fields `workspaces`, `selectedWorkspaceId`, `selectWorkspace(id)`.
+must never mix. Catalog and snapshot requests have bounded deadlines. Failed initial snapshots are
+retried automatically; a permanently closed EventSource rechecks the authenticated snapshot before
+opening a replacement stream. Sources still reconnecting natively remain in use. On service-generation change,
+discard the old numeric cursor and store before loading the replacement daemon's snapshot; a cursor
+from a previous process must not skip or merge events in a new process. Use `useDashboard` fields
+`workspaces`, `selectedWorkspaceId`, `selectWorkspace(id)`.
 
 ## Alternatives and verification
 

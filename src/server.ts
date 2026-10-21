@@ -107,6 +107,9 @@ export function startServer(
   }
   const staticDir = options.staticDir ?? DEFAULT_STATIC_DIRS.find((dir) => fs.existsSync(dir)) ?? DEFAULT_STATIC_DIRS[0]!;
   const token = options.token ?? createDashboardToken();
+  // Cursors describe this server's ingestion order, never the next daemon's. This public
+  // generation is independent of private control identities and credentials.
+  const streamEpoch = options.serviceId ? crypto.randomUUID() : undefined;
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const staleSweepMs = options.staleSweepMs ?? heartbeatMs;
   const maxStreamBufferBytes = options.maxStreamBufferBytes ?? MAX_STREAM_BUFFER_BYTES;
@@ -147,13 +150,13 @@ export function startServer(
       }
       if (pathname === "/api/snapshot") {
         const source = resolveWorkspace(requestUrl, workspaceSource);
-        return source ? sendJson(res, source.snapshot()) : send(res, 404, "Unknown Workspace", "text/plain; charset=utf-8");
+        return source ? sendJson(res, snapshotFrame(source.snapshot(), streamEpoch)) : send(res, 404, "Unknown Workspace", "text/plain; charset=utf-8");
       }
       if (pathname === "/api/stream") {
         const source = resolveWorkspace(requestUrl, workspaceSource);
         if (!source) return send(res, 404, "Unknown Workspace", "text/plain; charset=utf-8");
         if (clients.size >= maxStreamClients) return send(res, 503, "Too Many Streams", "text/plain; charset=utf-8");
-        return openStream(req, res, source, clients, requestUrl, heartbeatMs, maxStreamBufferBytes);
+        return openStream(req, res, source, clients, requestUrl, heartbeatMs, maxStreamBufferBytes, streamEpoch);
       }
       return send(res, 404, "Not Found", "text/plain; charset=utf-8");
     }
@@ -411,6 +414,7 @@ function openStream(
   url: URL,
   heartbeatMs: number,
   maxBufferBytes: number,
+  streamEpoch?: string,
 ): void {
   res.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -444,6 +448,7 @@ function openStream(
   const heartbeat = setInterval(() => write(": heartbeat\n\n"), heartbeatMs);
   heartbeat.unref?.();
   let lastSnapshotCursor = -1;
+  const eventId = (cursor: number): string => streamEpoch ? `${streamEpoch}:${cursor}` : String(cursor);
   /**
    * `snapshot` is the view a subscriber already holds; without one the source is asked for its own.
    * Both cost a deep clone of the whole graph — the subscriber's behind a getter `JSON.stringify`
@@ -453,7 +458,7 @@ function openStream(
     if (!active || res.destroyed || (snapshot?.cursor ?? source.cursor) === lastSnapshotCursor) return;
     const frame = snapshot ?? source.snapshot();
     lastSnapshotCursor = frame.cursor;
-    write(`id: ${frame.cursor}\nevent: snapshot\ndata: ${JSON.stringify(frame)}\n\n`);
+    write(`id: ${eventId(frame.cursor)}\nevent: snapshot\ndata: ${JSON.stringify(snapshotFrame(frame, streamEpoch))}\n\n`);
   };
   const sendDelta = (delta: TelemetryDelta, snapshot?: TelemetrySnapshot): void => {
     if (!active || res.destroyed) return;
@@ -461,12 +466,20 @@ function openStream(
     // over as a telemetry delta. It ships as the authoritative snapshot instead — exactly what
     // /api/snapshot would answer — so a stream client converges instead of diverging from it.
     if (isConsumerNotice(delta.event)) return sendSnapshot(snapshot);
-    write(`id: ${delta.cursor}\nevent: telemetry\ndata: ${JSON.stringify(delta)}\n\n`);
+    write(`id: ${eventId(delta.cursor)}\nevent: telemetry\ndata: ${JSON.stringify(delta)}\n\n`);
   };
   unsubscribe = source.subscribe((delta, snapshot) => sendDelta(delta, snapshot));
   clients.set(res, cleanup);
   const lastHeader = req.headers["last-event-id"];
-  const rawCursor = (typeof lastHeader === "string" ? lastHeader : url.searchParams.get("after") ?? url.searchParams.get("lastEventId")) ?? "";
+  let rawCursor = (typeof lastHeader === "string" ? lastHeader : url.searchParams.get("after") ?? url.searchParams.get("lastEventId")) ?? "";
+  if (streamEpoch) {
+    // EventSource resumes with its last ID; the first join forwards the HTTP snapshot's epoch.
+    // Missing/mismatched epochs require a snapshot even when the numeric cursor is still in range.
+    if (typeof lastHeader === "string") {
+      const prefix = `${streamEpoch}:`;
+      rawCursor = lastHeader.startsWith(prefix) ? lastHeader.slice(prefix.length) : "";
+    } else if (url.searchParams.get("streamEpoch") !== streamEpoch) rawCursor = "";
+  }
   const cursor = /^\d+$/.test(rawCursor) ? Number(rawCursor) : undefined;
   const backlog = cursor === undefined ? undefined : source.backlog(cursor);
   if (cursor !== undefined && backlog !== undefined) {
@@ -480,6 +493,10 @@ function openStream(
   // Without a listener Node re-emits a stream write failure as an uncaught exception, so a client
   // that dies mid-frame would end the user's agent session rather than its own connection.
   res.on("error", cleanup);
+}
+
+function snapshotFrame(snapshot: TelemetrySnapshot, streamEpoch?: string): TelemetrySnapshot & { streamEpoch?: string } {
+  return streamEpoch ? { ...snapshot, streamEpoch } : snapshot;
 }
 
 function serveStatic(

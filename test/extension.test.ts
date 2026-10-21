@@ -58,7 +58,7 @@ function mockPi(options: FlowExtensionOptions = {}, disabled = false) {
     close: async () => { closed += 1; },
   };
   createExtension(api, {
-    connect: async (connectOptions) => { connections += 1; connectionOptions.push(connectOptions); return connection; }, flushMs: 1,
+    connect: async (connectOptions) => { connections += 1; connectionOptions.push(connectOptions); return connection; }, flushMs: 1, retryMs: 5,
     ...options,
   });
   return {
@@ -321,19 +321,158 @@ test("the bus queue is bounded, serial, and does not clone graph state or redraw
   await m.stop();
 });
 
-test("heartbeat failure is visible, and manual serve reconnects instead of returning a dead client", async () => {
+test("heartbeat failure recovers automatically and drains events queued during the outage", async () => {
   let connects = 0;
+  let recover!: () => void;
+  const offline = new Promise<void>((done) => { recover = done; });
   const m = mockPi({ heartbeatMs: 5, connect: async () => {
-    connects += 1;
-    return { url, workspaceId: "workspace", publish: async () => {}, close: async () => {},
-      heartbeat: async () => { if (connects === 1) throw new Error("offline"); } };
+    const attempt = ++connects;
+    if (attempt === 2) await offline;
+    return { ...m.connection, url: attempt === 1 ? url : "http://127.0.0.1:9000/?token=Cd34",
+      heartbeat: async () => { if (attempt === 1) throw new Error("offline"); } };
   } });
-  await m.start();
-  await until(() => m.notices.some((text) => text.includes("unavailable")));
-  assert.match(m.statuses.at(-1)!, /unavailable/);
-  await m.command("serve"); assert.equal(connects, 2);
-  assert.match(m.statuses.at(-1)!, /127\.0\.0\.1/);
-  await m.stop();
+  try {
+    await m.start();
+    await until(() => m.notices.some((text) => text.includes("unavailable")));
+    assert.match(m.statuses.at(-1)!, /reconnecting/);
+    m.emit(event(1)); m.emit(event(2));
+    recover();
+    await until(() => m.published.flat().length === 2);
+    assert.equal(connects, 2, "no manual command is needed to reconnect");
+    assert.match(m.statuses.at(-1)!, /127\.0\.0\.1:9000/);
+    assert.equal(m.widgets.at(-1), "flow dashboard at http://127.0.0.1:9000/?token=Cd34");
+    assert.equal(m.closed, 1, "the obsolete client is closed before its replacement");
+  } finally { recover(); await m.stop(); }
+});
+
+test("failed startup retries automatically without dropping its queued bus events", async () => {
+  let attempts = 0;
+  const m = mockPi({ connect: async () => {
+    if (++attempts < 3) throw new Error("temporarily unavailable");
+    return m.connection;
+  } });
+  try {
+    await m.start(); m.emit(event(1));
+    await until(() => m.published.length === 1);
+    assert.equal(attempts, 3);
+    assert.deepEqual(m.published[0], [event(1)]);
+    assert.equal(m.notices.length, 1, "repeated failures do not spam the operator");
+    assert.ok(m.notices.every((text) => !text.includes("Run /dashboard")));
+  } finally { await m.stop(); }
+});
+
+test("exhausted delivery recovers automatically with the original IDs and ingestion order", async () => {
+  const batches: unknown[][] = [];
+  let connects = 0;
+  let failing!: () => void;
+  const blocked = new Promise<void>((done) => { failing = done; });
+  const m = mockPi({ connect: async () => {
+    const attempt = ++connects;
+    return { ...m.connection, publish: async (batch) => {
+      batches.push([...batch]);
+      if (attempt === 1) { await blocked; throw new Error("response lost"); }
+    } };
+  } });
+  try {
+    await m.start(); m.emit(event(1));
+    await until(() => batches.length === 1);
+    m.emit(event(2)); failing();
+    await until(() => connects === 2 && batches.length === 3);
+    assert.deepEqual(batches, [[event(1)], [event(1)], [event(1), event(2)]]);
+    assert.match(m.statuses.at(-1)!, /127\.0\.0\.1/);
+  } finally { failing(); await m.stop(); }
+});
+
+test("pending and in-flight events share the same bounded recovery budget", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((done) => { release = done; });
+  const batches: unknown[][] = [];
+  const m = mockPi({ connect: async () => ({ ...m.connection, publish: async (batch) => {
+    batches.push([...batch]); await blocked;
+  } }) });
+  try {
+    await m.start();
+    for (let seq = 1; seq <= 256; seq += 1) m.emit(event(seq));
+    await until(() => batches.length === 1);
+    m.emit(event(257));
+    assert.equal(m.notices.filter((text) => text.includes("queue is full")).length, 1);
+    release(); await pause(15);
+    assert.equal(batches.flat().length, 256);
+  } finally { release(); await m.stop(); }
+});
+
+test("stop cancels scheduled automatic retries", async () => {
+  let attempts = 0;
+  const m = mockPi({ retryMs: 25, connect: async () => { attempts += 1; throw new Error("offline"); } });
+  await m.start(); await m.command("stop");
+  await pause(60);
+  assert.equal(attempts, 1);
+  assert.equal(m.subscriptions.size, 0);
+});
+
+test("stop cancels an automatic reconnect and closes its late result", async () => {
+  let attempts = 0;
+  let recover!: () => void;
+  let signal: AbortSignal | undefined;
+  const pending = new Promise<void>((done) => { recover = done; });
+  const m = mockPi({ heartbeatMs: 5, connect: async (options) => {
+    const attempt = ++attempts;
+    if (attempt === 2) { signal = options.signal; await pending; }
+    return { ...m.connection, heartbeat: async () => { if (attempt === 1) throw new Error("offline"); } };
+  } });
+  try {
+    await m.start(); await until(() => signal !== undefined);
+    const stopping = m.command("stop");
+    assert.equal(signal?.aborted, true);
+    recover(); await stopping;
+    const notices = m.widgets.length;
+    await pause(25);
+    assert.equal(attempts, 2);
+    assert.equal(m.closed, 2);
+    assert.equal(m.widgets.length, notices, "a cancelled reconnect never announces its stale URL");
+    assert.equal(m.subscriptions.size, 0);
+  } finally { recover(); await m.stop(); }
+});
+
+test("session replacement invalidates a pending recovery and never forwards the old queue", async () => {
+  let attempts = 0;
+  let recover!: () => void;
+  const pending = new Promise<void>((done) => { recover = done; });
+  const m = mockPi({ heartbeatMs: 5, connect: async () => {
+    const attempt = ++attempts;
+    if (attempt === 2) await pending;
+    return { ...m.connection, heartbeat: async () => { if (attempt === 1) throw new Error("offline"); } };
+  } });
+  try {
+    await m.start(); await until(() => attempts === 2);
+    m.emit(event(1));
+    const cwd = join(tmpdir(), "replacement-workspace");
+    const replacing = m.start({ ...m.context, cwd });
+    recover(); await replacing;
+    m.emit(event(2, workspaceHash(cwd)));
+    await until(() => m.published.length === 1);
+    assert.deepEqual(m.published[0], [event(2, workspaceHash(cwd))]);
+    assert.equal(attempts, 3);
+    assert.equal(m.closed, 2, "both obsolete clients must close before the new session attaches");
+  } finally { recover(); await m.stop(); }
+});
+
+test("headless automatic recovery announces the new connection on stderr only", async () => {
+  let attempts = 0;
+  const written: string[] = [], errors: string[] = [];
+  const m = mockPi({ connect: async () => {
+    if (++attempts === 1) throw new Error("offline");
+    return m.connection;
+  } });
+  const stdout = process.stdout.write, stderr = process.stderr.write;
+  process.stdout.write = ((chunk: string | Uint8Array) => { if (typeof chunk !== "string") return stdout.call(process.stdout, chunk); written.push(chunk); return true; }) as typeof stdout;
+  process.stderr.write = ((chunk: string | Uint8Array) => { if (typeof chunk !== "string") return stderr.call(process.stderr, chunk); errors.push(chunk); return true; }) as typeof stderr;
+  try {
+    await m.start({ ...m.context, hasUI: false });
+    await until(() => errors.some((text) => text.startsWith("flow dashboard at ")));
+    assert.deepEqual(written, []);
+    assert.equal(attempts, 2);
+  } finally { process.stdout.write = stdout; process.stderr.write = stderr; await m.stop(); }
 });
 
 test("dashboard never collides with pi-persona commands", () => {

@@ -33,15 +33,20 @@ function snapshot(name: string): { cursor: number; state: ReturnType<typeof crea
 }
 
 class FakeEventSource extends EventTarget {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 2;
   static instances: FakeEventSource[] = [];
   onopen: ((event: Event) => unknown) | null = null;
   onerror: ((event: Event) => unknown) | null = null;
   closed = false;
+  readyState: number = FakeEventSource.CONNECTING;
   constructor(readonly url: string) {
     super();
     FakeEventSource.instances.push(this);
   }
-  close(): void { this.closed = true; }
+  close(): void { this.closed = true; this.readyState = FakeEventSource.CLOSED; }
+  fail(readyState: number): void { this.readyState = readyState; this.onerror?.(new Event("error")); }
   emit(type: string, data: unknown): void {
     this.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) }));
   }
@@ -70,6 +75,8 @@ function mountDashboard(): HTMLElement {
       createElement("span", { "data-testid": "workspace" }, dashboard.selectedWorkspaceId),
       createElement("span", { "data-testid": "catalog" }, dashboard.workspaces.map((workspace) => workspace.id).join(",")),
       createElement("span", { "data-testid": "instance" }, instance?.displayName ?? "empty"),
+      createElement("span", { "data-testid": "connection" }, dashboard.connection),
+      createElement("span", { "data-testid": "error" }, dashboard.error ?? ""),
       createElement("button", { onClick: () => dashboard.selectWorkspace("workspace-b") }, "select beta"),
     );
   }
@@ -94,6 +101,318 @@ afterEach(() => {
 });
 
 describe("workspace-scoped dashboard connection", () => {
+  it("automatically reboots a terminally closed stream and ignores all callbacks from its replaced source", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      return Promise.resolve(response({ ...snapshot(snapshotRequests === 1 ? "Before" : "Recovered"), streamEpoch: `daemon-${snapshotRequests}` }));
+    }));
+    const content = mountDashboard();
+    await flush();
+    const failed = FakeEventSource.instances[0]!;
+    act(() => { failed.fail(FakeEventSource.CLOSED); });
+    expect(content.querySelector('[data-testid="connection"]')?.textContent).toBe("offline");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(snapshotRequests).toBe(2);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(failed.closed).toBe(true);
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Recovered");
+    const recovered = FakeEventSource.instances[1]!;
+    const url = new URL(recovered.url, window.location.origin);
+    expect(url.searchParams.get("streamEpoch")).toBe("daemon-2");
+    act(() => {
+      recovered.readyState = FakeEventSource.OPEN;
+      recovered.onopen?.(new Event("open"));
+      failed.onopen?.(new Event("open"));
+      failed.emit("telemetry", { cursor: 99, event: { ...started("Late delta"), id: "late-delta", seq: 99 } });
+      failed.emit("snapshot", snapshot("Late snapshot"));
+      failed.fail(FakeEventSource.CLOSED);
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(snapshotRequests).toBe(2);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Recovered");
+    expect(content.querySelector('[data-testid="connection"]')?.textContent).toBe("live");
+  });
+
+  it("retains native stream retries while EventSource is still connecting", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      return Promise.resolve(response(snapshot("Native retry")));
+    }));
+    const content = mountDashboard();
+    await flush();
+    const source = FakeEventSource.instances[0]!;
+    act(() => { source.fail(FakeEventSource.CONNECTING); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(snapshotRequests).toBe(1);
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(source.closed).toBe(false);
+    act(() => { source.readyState = FakeEventSource.OPEN; source.onopen?.(new Event("open")); });
+    expect(content.querySelector('[data-testid="connection"]')?.textContent).toBe("live");
+  });
+
+  it.each(["switch", "unmount"])("cancels terminal-stream rebootstrap on %s", async (action) => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let alphaRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(String(input), window.location.origin);
+      if (url.pathname === "/api/workspaces") return Promise.resolve(response(catalog));
+      if (url.searchParams.get("workspace") === "workspace-b") return Promise.resolve(response(snapshot("Beta")));
+      alphaRequests += 1;
+      return Promise.resolve(response(snapshot("Alpha")));
+    }));
+    const content = mountDashboard();
+    await flush();
+    act(() => { FakeEventSource.instances[0]!.fail(FakeEventSource.CLOSED); });
+    if (action === "switch") act(() => { (content.querySelector("button") as HTMLButtonElement).click(); });
+    else { act(() => { root!.unmount(); }); root = undefined; }
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(alphaRequests).toBe(1);
+    expect(FakeEventSource.instances).toHaveLength(action === "switch" ? 2 : 1);
+    if (action === "switch") expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Beta");
+  });
+
+  it("stops terminal-stream recovery when the fresh snapshot rejects authorization", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      return Promise.resolve(snapshotRequests === 1 ? response(snapshot("Before auth failure")) : { ok: false, status: 401 } as Response);
+    }));
+    const content = mountDashboard();
+    await flush();
+    act(() => { FakeEventSource.instances[0]!.fail(FakeEventSource.CLOSED); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(snapshotRequests).toBe(2);
+    expect(FakeEventSource.instances).toHaveLength(1);
+    expect(content.querySelector('[data-testid="error"]')?.textContent).toContain("Not authorized");
+  });
+
+  it("bounds a hung initial workspace catalog and recovers on the existing refresh loop", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let catalogRequests = 0;
+    let snapshotRequests = 0;
+    let firstSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith("/api/snapshot")) {
+        snapshotRequests += 1;
+        return Promise.resolve(response(snapshot("Recovered catalog")));
+      }
+      catalogRequests += 1;
+      if (catalogRequests !== 1) return Promise.resolve(response(catalog));
+      firstSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        firstSignal?.addEventListener("abort", () => reject(new DOMException("Request aborted", "AbortError")), { once: true });
+      });
+    }));
+    const content = mountDashboard();
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_999); });
+    expect(catalogRequests).toBe(1);
+    expect(snapshotRequests).toBe(0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(firstSignal?.aborted).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(catalogRequests).toBeGreaterThanOrEqual(2);
+    expect(catalogRequests).toBeLessThanOrEqual(3);
+    expect(snapshotRequests).toBe(1);
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Recovered catalog");
+    expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it("cancels a hung catalog request and its deadline on unmount", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let requestSignal: AbortSignal | undefined;
+    const fetcher = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      requestSignal = init?.signal ?? undefined;
+      requestSignal?.addEventListener("abort", () => reject(new DOMException("Request aborted", "AbortError")), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetcher);
+    mountDashboard();
+    await flush();
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    act(() => { root!.unmount(); });
+    root = undefined;
+    await flush();
+    expect(requestSignal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(FakeEventSource.instances).toHaveLength(0);
+  });
+
+  it.each([503, 404, 429])("automatically retries an initial snapshot outage and HTTP %s before opening its stream", async (status) => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(String(input), window.location.origin);
+      if (url.pathname === "/api/workspaces") return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      if (snapshotRequests === 1) return Promise.reject(new TypeError("Failed to fetch"));
+      if (snapshotRequests === 2) return Promise.resolve({ ok: false, status } as Response);
+      return Promise.resolve(response({ ...snapshot("Recovered"), streamEpoch: "new-daemon-epoch" }));
+    }));
+
+    const content = mountDashboard();
+    await flush();
+    expect(snapshotRequests).toBe(1);
+    expect(FakeEventSource.instances).toHaveLength(0);
+    expect(content.querySelector('[data-testid="connection"]')?.textContent).toBe("offline");
+    await act(async () => { await vi.advanceTimersByTimeAsync(999); });
+    expect(snapshotRequests).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(snapshotRequests).toBe(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1999); });
+    expect(snapshotRequests).toBe(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(snapshotRequests).toBe(3);
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Recovered");
+    expect(FakeEventSource.instances).toHaveLength(1);
+    const streamUrl = new URL(FakeEventSource.instances[0]!.url, window.location.origin);
+    expect(streamUrl.searchParams.get("token")).toBe("test-token");
+    expect(streamUrl.searchParams.get("streamEpoch")).toBe("new-daemon-epoch");
+  });
+
+  it("caps repeated snapshot outage delays at thirty seconds", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      return Promise.reject(new TypeError("Failed to fetch"));
+    }));
+    mountDashboard();
+    await flush();
+    for (const delay of [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
+      const previous = snapshotRequests;
+      await act(async () => { await vi.advanceTimersByTimeAsync(delay - 1); });
+      expect(snapshotRequests).toBe(previous);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(snapshotRequests).toBe(previous + 1);
+    }
+    expect(FakeEventSource.instances).toHaveLength(0);
+  });
+
+  it("passes the snapshot epoch to the initial stream and accepts an authoritative restart snapshot", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.stubGlobal("EventSource", FakeEventSource);
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => Promise.resolve(response(
+      String(input).startsWith("/api/workspaces") ? catalog : { ...snapshot("Before restart"), streamEpoch: "first-daemon" },
+    ))));
+    const content = mountDashboard();
+    await flush();
+    const source = FakeEventSource.instances[0]!;
+    const url = new URL(source.url, window.location.origin);
+    expect(url.searchParams.get("after")).toBe("1");
+    expect(url.searchParams.get("streamEpoch")).toBe("first-daemon");
+    act(() => { source.emit("snapshot", { cursor: 0, state: createGraphState(), streamEpoch: "replacement-daemon" }); });
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("empty");
+    act(() => { source.emit("telemetry", { cursor: 1, event: { ...started("After restart"), id: "restart-event" } }); });
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("After restart");
+  });
+
+  it("bounds a hung initial snapshot and retries it automatically", async () => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    let firstSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      if (snapshotRequests !== 1) return Promise.resolve(response(snapshot("Recovered after timeout")));
+      firstSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        firstSignal?.addEventListener("abort", () => reject(new DOMException("Request aborted", "AbortError")), { once: true });
+      });
+    }));
+    const content = mountDashboard();
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(firstSignal?.aborted).toBe(true);
+    expect(snapshotRequests).toBe(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(snapshotRequests).toBe(2);
+    expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Recovered after timeout");
+  });
+
+  it.each([401, 403])("keeps authorization failures terminal without retrying HTTP %s", async (status) => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let snapshotRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      if (String(input).startsWith("/api/workspaces")) return Promise.resolve(response(catalog));
+      snapshotRequests += 1;
+      return Promise.resolve({ ok: false, status } as Response);
+    }));
+    const content = mountDashboard();
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(snapshotRequests).toBe(1);
+    expect(content.querySelector('[data-testid="error"]')?.textContent).toContain("Not authorized");
+    expect(FakeEventSource.instances).toHaveLength(0);
+  });
+
+  it.each(["switch", "unmount"])("cancels a pending outage retry on %s", async (action) => {
+    oldUrl = window.location.href;
+    window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a");
+    vi.useFakeTimers();
+    vi.stubGlobal("EventSource", FakeEventSource);
+    let alphaRequests = 0;
+    vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+      const url = new URL(String(input), window.location.origin);
+      if (url.pathname === "/api/workspaces") return Promise.resolve(response(catalog));
+      if (url.searchParams.get("workspace") === "workspace-b") return Promise.resolve(response(snapshot("Beta")));
+      alphaRequests += 1;
+      return Promise.reject(new TypeError("Failed to fetch"));
+    }));
+    const content = mountDashboard();
+    await flush();
+    if (action === "switch") act(() => { (content.querySelector("button") as HTMLButtonElement).click(); });
+    else { act(() => { root!.unmount(); }); root = undefined; }
+    await flush();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(alphaRequests).toBe(1);
+    expect(FakeEventSource.instances).toHaveLength(action === "switch" ? 1 : 0);
+    if (action === "switch") expect(content.querySelector('[data-testid="instance"]')?.textContent).toBe("Beta");
+  });
+
   it("aborts a late snapshot and never opens or applies the old workspace stream after switching", async () => {
     oldUrl = window.location.href;
     window.history.replaceState(null, "", "/?token=test-token&workspace=workspace-a#view");

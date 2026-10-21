@@ -23,16 +23,19 @@ export interface DashboardState {
   error?: string;
 }
 
-interface SnapshotFrame { cursor: number; state: GraphState }
+interface SnapshotFrame { cursor: number; state: GraphState; streamEpoch?: string }
 interface DeltaFrame { cursor: number; event: TelemetryEvent }
 
 function snapshotFrame(value: unknown): SnapshotFrame | undefined {
   if (!value || typeof value !== "object") return undefined;
-  const candidate = value as { cursor?: unknown; state?: unknown };
+  const candidate = value as { cursor?: unknown; state?: unknown; streamEpoch?: unknown };
   if (!Number.isSafeInteger(candidate.cursor) || (candidate.cursor as number) < 0 || !candidate.state || typeof candidate.state !== "object") return undefined;
+  if (candidate.streamEpoch !== undefined && (typeof candidate.streamEpoch !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(candidate.streamEpoch))) return undefined;
   const state = candidate.state as Partial<GraphState>;
   if (!state.instances || !state.agents || !state.tools || !Array.isArray(state.messages) || !Array.isArray(state.events)) return undefined;
-  return { cursor: candidate.cursor as number, state: candidate.state as GraphState };
+  return { cursor: candidate.cursor as number, state: candidate.state as GraphState,
+    ...(typeof candidate.streamEpoch === "string" ? { streamEpoch: candidate.streamEpoch } : {}),
+  };
 }
 
 function deltaFrame(value: unknown): DeltaFrame | undefined {
@@ -93,10 +96,11 @@ function parseWorkspaceCatalog(value: unknown): WorkspaceCatalog | undefined {
   };
 }
 
-function endpoint(path: string, token: string, workspaceId = "", after = ""): string {
+function endpoint(path: string, token: string, workspaceId = "", after = "", streamEpoch = ""): string {
   const params = new URLSearchParams({ token });
   if (workspaceId) params.set("workspace", workspaceId);
   if (after) params.set("after", after);
+  if (streamEpoch) params.set("streamEpoch", streamEpoch);
   return `${path}?${params.toString()}`;
 }
 
@@ -116,6 +120,8 @@ export function useDashboard(): DashboardState {
       if (inFlight) return;
       const controller = new AbortController();
       inFlight = controller;
+      let timedOut = false;
+      const deadline = window.setTimeout(() => { timedOut = true; controller.abort(); }, 10_000);
       try {
         const response = await fetch(endpoint("/api/workspaces", token), {
           headers: { Accept: "application/json" }, signal: controller.signal,
@@ -130,9 +136,10 @@ export function useDashboard(): DashboardState {
         setCatalogLoaded(true);
         setCatalogError(undefined);
       } catch (error) {
-        if (disposed || (error instanceof DOMException && error.name === "AbortError")) return;
-        setCatalogError(error instanceof Error ? error.message : "Unable to load workspace catalog");
+        if (disposed || (controller.signal.aborted && !timedOut)) return;
+        setCatalogError(timedOut ? "Workspace catalog request timed out — retrying" : error instanceof Error ? error.message : "Unable to load workspace catalog");
       } finally {
+        window.clearTimeout(deadline);
         if (inFlight === controller) inFlight = undefined;
       }
     };
@@ -180,56 +187,95 @@ export function useDashboard(): DashboardState {
 
     const token = tokenFromLocation();
     const workspaceId = selectedWorkspaceId;
-    const controller = new AbortController();
+    let inFlight: AbortController | undefined;
     let source: EventSource | undefined;
+    let retry: number | undefined;
+    let retryDelay = 1_000;
     let disposed = false;
     setStream({ graph: createGraphState(), cursor: 0, connection: "connecting" });
 
-    const failFrame = (): void => { if (!disposed) setStream((current) => ({ ...current, error: "Received an unreadable telemetry frame" })); };
+    const scheduleRetry = (): void => {
+      if (disposed || retry !== undefined) return;
+      retry = window.setTimeout(() => { retry = undefined; void load(); }, retryDelay);
+      retryDelay = Math.min(retryDelay * 2, 30_000);
+    };
     const load = async (): Promise<void> => {
+      if (disposed || inFlight || source) return;
+      const controller = new AbortController();
+      inFlight = controller;
+      let retryable = true;
+      let timedOut = false;
+      const deadline = window.setTimeout(() => { timedOut = true; controller.abort(); }, 10_000);
       try {
         const response = await fetch(endpoint("/api/snapshot", token, workspaceId), {
           headers: { Accept: "application/json" }, signal: controller.signal,
         });
+        retryable = [408, 425, 429].includes(response.status) || response.status >= 500
+          || (response.status === 404 && selectionState === "available");
         if (response.status === 401 || response.status === 403) {
           throw new Error("Not authorized — this dashboard needs its session token. Run /dashboard in pi, or /dashboard status to copy the link.");
         }
-        if (response.status === 404) throw new Error("Workspace not found — choose a workspace from the refreshed list.");
+        if (response.status === 404) throw new Error(retryable ? "Workspace is reconnecting" : "Workspace not found — choose a workspace from the refreshed list.");
         if (!response.ok) throw new Error(`snapshot returned ${response.status}`);
-        const initial = snapshotFrame(await response.json());
+        const value: unknown = await response.json();
+        const initial = snapshotFrame(value);
         if (!initial) throw new Error("snapshot schema is incompatible");
         if (disposed || controller.signal.aborted) return;
         setStream({ graph: initial.state, cursor: initial.cursor, connection: "connecting" });
-        source = new EventSource(endpoint("/api/stream", token, workspaceId, String(initial.cursor)));
-        source.onopen = () => { if (!disposed) setStream((current) => ({ ...current, connection: "live", error: undefined })); };
-        source.addEventListener("telemetry", ((message: MessageEvent<string>) => {
-          if (disposed) return;
+        const nextSource = new EventSource(endpoint("/api/stream", token, workspaceId, String(initial.cursor), initial.streamEpoch));
+        source = nextSource;
+        const isCurrentSource = (): boolean => !disposed && source === nextSource;
+        const failFrame = (): void => {
+          setStream((current) => isCurrentSource() ? { ...current, error: "Received an unreadable telemetry frame" } : current);
+        };
+        nextSource.onopen = () => {
+          if (!isCurrentSource()) return;
+          retryDelay = 1_000;
+          setStream((current) => isCurrentSource() ? { ...current, connection: "live", error: undefined } : current);
+        };
+        nextSource.addEventListener("telemetry", ((message: MessageEvent<string>) => {
+          if (!isCurrentSource()) return;
           try {
             const delta = deltaFrame(JSON.parse(message.data));
             if (!delta) return failFrame();
-            setStream((current) => disposed || delta.cursor <= current.cursor ? current : {
+            setStream((current) => !isCurrentSource() || delta.cursor <= current.cursor ? current : {
               graph: reduceTelemetry(current.graph, delta.event), cursor: delta.cursor, connection: "live",
             });
           } catch { failFrame(); }
         }) as EventListener);
-        source.addEventListener("snapshot", ((message: MessageEvent<string>) => {
-          if (disposed) return;
+        nextSource.addEventListener("snapshot", ((message: MessageEvent<string>) => {
+          if (!isCurrentSource()) return;
           try {
             const snapshot = snapshotFrame(JSON.parse(message.data));
             if (!snapshot) return failFrame();
-            setStream({ graph: snapshot.state, cursor: snapshot.cursor, connection: "live" });
+            setStream((current) => isCurrentSource() ? { graph: snapshot.state, cursor: snapshot.cursor, connection: "live" } : current);
           } catch { failFrame(); }
         }) as EventListener);
-        source.onerror = () => { if (!disposed) setStream((current) => ({ ...current, connection: "offline", error: "Stream disconnected — retrying" })); };
+        nextSource.onerror = () => {
+          if (!isCurrentSource()) return;
+          setStream((current) => ({ ...current, connection: "offline", error: "Stream disconnected — retrying" }));
+          // HTTP errors can permanently close native EventSource. Recheck the authenticated
+          // snapshot before replacing it; CONNECTING sources retain their built-in reconnect.
+          if (nextSource.readyState === EventSource.CLOSED) {
+            nextSource.close();
+            source = undefined;
+            scheduleRetry();
+          }
+        };
       } catch (error) {
-        if (!disposed && !(error instanceof DOMException && error.name === "AbortError")) {
-          setStream((current) => ({ ...current, connection: "offline", error: error instanceof Error ? error.message : "Unable to load snapshot" }));
-        }
+        if (disposed || (controller.signal.aborted && !timedOut)) return;
+        const shouldRetry = retryable || timedOut || error instanceof TypeError;
+        const detail = timedOut ? "Snapshot request timed out" : error instanceof Error ? error.message : "Unable to load snapshot";
+        setStream((current) => ({ ...current, connection: "offline", error: shouldRetry ? `${detail} — retrying` : detail }));
+        if (shouldRetry) scheduleRetry();
+      } finally {
+        window.clearTimeout(deadline);
+        if (inFlight === controller) inFlight = undefined;
       }
     };
 
     void load();
-    return () => { disposed = true; controller.abort(); source?.close(); };
+    return () => { disposed = true; if (retry !== undefined) window.clearTimeout(retry); inFlight?.abort(); source?.close(); };
   }, [catalogLoaded, selectedWorkspaceId, selectionState]);
 
   const selectWorkspace = useCallback((id: string): void => {

@@ -12,6 +12,8 @@ const STARTUP_GRACE_MS = 15_000;
 export interface SharedServiceOptions {
   agentDir: string;
   port: number;
+  /** Read-only browser capability retained by the native entrypoint across daemon replacement. */
+  browserToken?: string;
   idleMs?: number;
   leaseMs?: number;
   /** Maximum registered Pi sessions; defaults to 256 to keep registry memory bounded. */
@@ -63,6 +65,7 @@ export async function startSharedService(options: SharedServiceOptions): Promise
 
   const serverOptions = {
     port: options.port,
+    token: options.browserToken,
     workspaceSource: registry,
     controlPlane: registry,
     controlToken,

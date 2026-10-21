@@ -45,7 +45,7 @@ users do not need to run Vite or install a system service.
 ```text
 /dashboard         start and open the dashboard
 /dashboard open    open the running dashboard
-/dashboard serve   attach/reconnect without opening a browser
+/dashboard serve   attach or retry immediately without opening a browser
 /dashboard status  show the current authenticated URL
 /dashboard stop    detach this session, including a pending attachment
 ```
@@ -68,8 +68,9 @@ flow dashboard at http://127.0.0.1:7874/?token=Ab0T
 ```
 
 Use that link, or `/dashboard status`. A bare `http://127.0.0.1:7874` loads the page but
-cannot authenticate the API. The launch code is random, case-sensitive and changes whenever
-the server restarts.
+cannot authenticate the API. The random, case-sensitive launch code is retained across service
+restarts, so an open dashboard can reconnect automatically. If another process takes its port,
+Flow announces a new URL in Pi.
 
 Default port: `7874`; set `PI_PERSONA_FLOW_PORT` to override it (`0` asks the OS for a port).
 When pi-persona is installed, Flow also reads its version-1 `persona/settings.json` preferences
@@ -86,8 +87,11 @@ even a short idle preference survive a slow cold start. After a client has conne
 exits after the configured idle grace with no attached Pi sessions and no dashboard SSE connections.
 An open dashboard keeps the service alive and can review retained work. No OS-wide daemon is installed.
 Delegated workers do not attach as extra supervisors. Headless autostart announces its URL on
-stderr, keeping JSON/RPC/print stdout clean. If the service becomes unavailable, the Pi footer
-reports it; `/dashboard serve` reconnects.
+stderr, keeping JSON/RPC/print stdout clean. Flow automatically retries failed startup and lost
+connections with bounded backoff, starting a replacement service when needed. No recovery command
+is required; `/dashboard serve` requests an immediate attempt. The Pi footer shows connection state
+and restores the dashboard link after recovery. Pending live events stay within a bounded buffer;
+overflow is reported, and compatible file-backed history remains available after reconnecting.
 
 Each workspace has a separate event store, file tailer, replay cursor and graph. Changing it
 resets scoped filters, replay and selection; old requests cannot populate the new view.

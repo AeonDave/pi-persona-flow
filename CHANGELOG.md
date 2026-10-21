@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Recover automatically from failed startup and lost shared-service connections with bounded backoff,
+  recreating the daemon through the existing startup election when needed. Restore the current Pi
+  dashboard link after recovery; `/dashboard serve` remains an optional immediate retry.
+- Retain the browser launch code and prefer the previous port on daemon recovery so an open dashboard
+  can reconnect. Reset replay cursors across service generations and retry failed initial snapshots;
+  announce a new URL if the previous port is occupied.
+- Reopen browser streams closed by transient HTTP errors after rechecking an authenticated snapshot;
+  cancel superseded callbacks and retries when changing workspaces or closing the dashboard.
+- Retain pending live batches through reconnection with unchanged event IDs and one combined
+  count/byte budget for queued and in-flight events. Report overflow, preserve file-backed history
+  recovery, and cancel retries and late connections on stop or session replacement.
+- Update the dashboard's Vite development dependency to 8.3.5 for its security fixes.
+
 ## [0.3.1](https://github.com/AeonDave/pi-persona-flow/compare/v0.3.0...v0.3.1) - 2026-10-20
 
 - Read Flow's public attachment, port and idle preferences from pi-persona's version-1

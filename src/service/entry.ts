@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import type { SharedServiceDescriptor } from "../../shared/workspaces.ts";
 import { startSharedService, type SharedService } from "./host.ts";
+import { readBrowserBinding, writeBrowserBinding } from "./browser-binding.ts";
 
 const DEFAULT_IDLE_MS = 60_000;
 const MIN_IDLE_MS = 50;
@@ -28,7 +29,9 @@ async function main(): Promise<void> {
 		requestedClose = service.close().catch((error: unknown) => { closeError = error; });
 	};
 	try {
-		service = await startSharedService({ agentDir, port, idleMs: idleWindowMs() });
+		const binding = await readBrowserBinding(directory, port);
+		service = await startSharedService({ agentDir, port: binding?.port ?? port, browserToken: binding?.token, idleMs: idleWindowMs() });
+		await writeBrowserBinding(directory, port, service.url);
 		descriptor = {
 			protocol: service.protocol,
 			serviceId: service.serviceId,
