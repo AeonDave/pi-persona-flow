@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.3.2](https://github.com/AeonDave/pi-persona-flow/compare/v0.3.1...v0.3.2) - 2026-10-21
+
 - Recover automatically from failed startup and lost shared-service connections with bounded backoff,
   recreating the daemon through the existing startup election when needed. Restore the current Pi
   dashboard link after recovery; `/dashboard serve` remains an optional immediate retry.

@@ -26,7 +26,7 @@ pi install git:github.com/AeonDave/pi-persona-flow
 For a reproducible install of this stable release, pin the tag:
 
 ```bash
-pi install git:github.com/AeonDave/pi-persona-flow@v0.3.1
+pi install git:github.com/AeonDave/pi-persona-flow@v0.3.2
 ```
 
 Restart Pi or run `/reload`. Flow attaches to one shared local service automatically,
